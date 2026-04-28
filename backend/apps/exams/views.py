@@ -1099,77 +1099,149 @@ class AntiCheatingBeaconView(generics.GenericAPIView):
     permission_classes = [permissions.AllowAny]
     
     def post(self, request, *args, **kwargs):
+        logger = logging.getLogger(__name__)
+        
         try:
             data = request.data
+            
             if isinstance(data, bytes):
                 import json
                 data = json.loads(data.decode('utf-8'))
+            
+            if request.body and isinstance(data, dict) and 'type' not in data:
+                try:
+                    import json
+                    data = json.loads(request.body.decode('utf-8'))
+                except:
+                    pass
             
             attempt_id = data.get('attempt_id')
             exam_id = data.get('exam_id')
             event_type = data.get('type')
             event_data = data.get('data', {})
             
+            logger.info(f"Beacon received: type={event_type}, attempt_id={attempt_id}")
+            
             if not attempt_id:
-                return Response({'status': 'ignored'}, status=status.HTTP_200_OK)
+                return Response({'status': 'ignored', 'reason': 'no_attempt_id'}, status=status.HTTP_200_OK)
             
             try:
                 attempt = ExamAttempt.objects.select_related('exam').get(id=attempt_id)
             except ExamAttempt.DoesNotExist:
+                logger.warning(f"Beacon: attempt {attempt_id} not found")
                 return Response({'status': 'not_found'}, status=status.HTTP_200_OK)
             
             if attempt.status not in ['in_progress', 'paused']:
-                return Response({'status': 'already_submitted'}, status=status.HTTP_200_OK)
+                logger.info(f"Beacon: attempt {attempt_id} is not in progress, status: {attempt.status}")
+                return Response({'status': 'already_submitted', 'current_status': attempt.status}, status=status.HTTP_200_OK)
             
             self._handle_beacon_event(attempt, event_type, event_data, request)
             
-            return Response({'status': 'received'}, status=status.HTTP_200_OK)
+            return Response({'status': 'received', 'event_type': event_type}, status=status.HTTP_200_OK)
             
         except Exception as e:
-            import logging
-            logger = logging.getLogger(__name__)
-            logger.warning(f'Beacon processing error: {str(e)}')
-            return Response({'status': 'error'}, status=status.HTTP_200_OK)
+            logger.error(f'Beacon processing error: {str(e)}', exc_info=True)
+            return Response({'status': 'error', 'message': str(e)}, status=status.HTTP_200_OK)
     
     def _handle_beacon_event(self, attempt, event_type, event_data, request):
         from django.utils import timezone
+        from django.db import transaction
+        
+        logger = logging.getLogger(__name__)
         
         now = timezone.now()
         
+        ip_address = request.META.get('REMOTE_ADDR', 'unknown')
+        user_agent = request.META.get('HTTP_USER_AGENT', 'unknown')
+        
+        common_details = {
+            'timestamp': event_data.get('timestamp', now.isoformat()),
+            'ip': ip_address,
+            'user_agent': user_agent
+        }
+        
         if event_type == 'before_unload':
+            logger.info(f"Beacon: before_unload for attempt {attempt.id}")
+            
             ExamActivityLog.objects.create(
                 attempt=attempt,
                 activity_type='page_unload',
-                details={
-                    'timestamp': event_data.get('timestamp'),
-                    'ip': request.META.get('REMOTE_ADDR', 'unknown'),
-                    'user_agent': request.META.get('HTTP_USER_AGENT', 'unknown')
-                }
+                details=common_details
             )
+            
+            violation_state = event_data.get('violation_state', {})
+            if violation_state:
+                self._process_violation_state(attempt, violation_state)
         
         elif event_type == 'page_hide':
+            logger.info(f"Beacon: page_hide for attempt {attempt.id}")
+            
             violation_state = event_data.get('violation_state', {})
+            
+            details = {
+                **common_details,
+                'violation_state': violation_state,
+                'last_activity': event_data.get('last_activity'),
+                'tab_switch_count': event_data.get('tab_switch_count')
+            }
             
             ExamActivityLog.objects.create(
                 attempt=attempt,
                 activity_type='page_hide',
-                details={
-                    'timestamp': event_data.get('timestamp'),
-                    'violation_state': violation_state,
-                    'last_activity': event_data.get('last_activity')
-                }
+                details=details
             )
             
             if violation_state:
-                self._check_violation_threshold(attempt, violation_state)
+                self._process_violation_state(attempt, violation_state)
+            
+            self._record_tab_leave_if_needed(attempt, event_data)
+        
+        elif event_type == 'beacon_event':
+            logger.info(f"Beacon: beacon_event for attempt {attempt.id}")
+            
+            sub_event_type = event_data.get('event_type', 'unknown')
+            details = {
+                **common_details,
+                'sub_event_type': sub_event_type,
+                'data': event_data
+            }
+            
+            ExamActivityLog.objects.create(
+                attempt=attempt,
+                activity_type=f'beacon_{sub_event_type}',
+                details=details
+            )
+            
+            self._handle_specific_beacon_event(attempt, sub_event_type, event_data, request)
+        
+        else:
+            logger.info(f"Beacon: unknown event type '{event_type}' for attempt {attempt.id}")
+            
+            ExamActivityLog.objects.create(
+                attempt=attempt,
+                activity_type=f'beacon_{event_type}',
+                details={
+                    **common_details,
+                    'event_type': event_type,
+                    'data': event_data
+                }
+            )
     
-    def _check_violation_threshold(self, attempt, violation_state):
-        from django.utils import timezone
+    def _process_violation_state(self, attempt, violation_state):
+        logger = logging.getLogger(__name__)
+        logger.info(f"Processing violation state for attempt {attempt.id}: {violation_state}")
         
         tab_switch_count = violation_state.get('tabSwitchCount', 0)
         total_violations = violation_state.get('totalViolations', 0)
+        dev_tools_open_attempts = violation_state.get('devToolsOpenAttempts', 0)
+        refresh_attempts = violation_state.get('refreshAttempts', 0)
+        copy_attempts = violation_state.get('copyAttempts', 0)
+        paste_attempts = violation_state.get('pasteAttempts', 0)
         
-        max_tab_switches = attempt.exam.get_max_tab_switches()
+        max_tab_switches = getattr(attempt.exam, 'max_tab_switches', 3) or 3
+        max_violations = 10
+        max_dev_tools = 2
+        max_refresh = 2
         
         should_force_submit = False
         reason = ''
@@ -1177,19 +1249,157 @@ class AntiCheatingBeaconView(generics.GenericAPIView):
         if tab_switch_count >= max_tab_switches:
             should_force_submit = True
             reason = f'切出页面次数超过限制({max_tab_switches}次)'
-        elif total_violations >= 10:
+        
+        elif dev_tools_open_attempts >= max_dev_tools:
             should_force_submit = True
-            reason = f'违规次数超过限制(10次)'
+            reason = f'开发者工具打开超过限制({max_dev_tools}次)'
+        
+        elif refresh_attempts >= max_refresh:
+            should_force_submit = True
+            reason = f'刷新页面超过限制({max_refresh}次)'
+        
+        elif total_violations >= max_violations:
+            should_force_submit = True
+            reason = f'违规次数超过限制({max_violations}次)'
         
         if should_force_submit and attempt.status == 'in_progress':
+            logger.warning(f"Force submitting attempt {attempt.id} from Beacon: {reason}")
+            self._force_submit_attempt(attempt, reason)
+        
+        elif tab_switch_count > 0 or copy_attempts > 0 or paste_attempts > 0:
+            logger.info(f"Recording violations for attempt {attempt.id}: tab={tab_switch_count}, copy={copy_attempts}, paste={paste_attempts}")
+            
+            if tab_switch_count > 0:
+                self._record_cheating(
+                    attempt,
+                    'tab_switch_from_beacon',
+                    f'Beacon检测到切出页面，次数: {tab_switch_count}',
+                    'medium',
+                    {'count': tab_switch_count, 'source': 'beacon'}
+                )
+            
+            if copy_attempts > 0:
+                self._record_cheating(
+                    attempt,
+                    'copy_attempt_from_beacon',
+                    f'Beacon检测到复制尝试，次数: {copy_attempts}',
+                    'low',
+                    {'count': copy_attempts}
+                )
+            
+            if paste_attempts > 0:
+                self._record_cheating(
+                    attempt,
+                    'paste_attempt_from_beacon',
+                    f'Beacon检测到粘贴尝试，次数: {paste_attempts}',
+                    'low',
+                    {'count': paste_attempts}
+                )
+    
+    def _handle_specific_beacon_event(self, attempt, event_type, event_data, request):
+        if event_type in ['tab_leave', 'tab_switch']:
+            count = event_data.get('count', 1)
+            self._record_cheating(
+                attempt,
+                'tab_switch',
+                f'切出页面，次数: {count}',
+                'medium',
+                {'count': count, 'source': 'beacon'}
+            )
+        
+        elif event_type in ['dev_tools_open', 'console_open']:
+            detection_method = event_data.get('detection_method', 'beacon')
+            count = event_data.get('count', 1)
+            self._record_cheating(
+                attempt,
+                event_type,
+                f'检测到开发者工具/控制台打开（{detection_method}）',
+                'high',
+                {'detection_method': detection_method, 'count': count}
+            )
+        
+        elif event_type in ['refresh_attempt', 'refresh_detected']:
+            self._record_cheating(
+                attempt,
+                event_type,
+                '检测到页面刷新尝试',
+                'medium',
+                {'source': 'beacon'}
+            )
+        
+        elif event_type in ['copy_attempt', 'paste_attempt', 'cut_attempt']:
+            self._record_cheating(
+                attempt,
+                event_type,
+                f'检测到{event_type.replace("_", " ")}',
+                'low',
+                {'source': 'beacon'}
+            )
+    
+    def _record_tab_leave_if_needed(self, attempt, event_data):
+        tab_switch_count = event_data.get('tab_switch_count', 0)
+        if tab_switch_count > 0:
+            from django.utils import timezone
+            
+            existing_count = CheatingRecord.objects.filter(
+                attempt=attempt,
+                cheating_type='tab_switch'
+            ).count()
+            
+            if tab_switch_count > existing_count:
+                self._record_cheating(
+                    attempt,
+                    'tab_switch',
+                    f'页面隐藏时检测到切出页面，次数: {tab_switch_count}',
+                    'medium',
+                    {'count': tab_switch_count, 'source': 'page_hide'}
+                )
+    
+    def _record_cheating(self, attempt, cheating_type, description, severity, evidence):
+        try:
+            CheatingRecord.objects.create(
+                attempt=attempt,
+                cheating_type=cheating_type,
+                description=description,
+                severity=severity,
+                evidence=evidence or {}
+            )
+            
+            if severity in ['high', 'critical']:
+                attempt.is_cheating_detected = True
+                if not attempt.cheating_reason:
+                    attempt.cheating_reason = description
+                else:
+                    attempt.cheating_reason = f"{attempt.cheating_reason}; {description}"
+                attempt.save(update_fields=['is_cheating_detected', 'cheating_reason'])
+        
+        except Exception as e:
+            logger = logging.getLogger(__name__)
+            logger.error(f"Failed to record cheating from beacon: {str(e)}")
+    
+    def _force_submit_attempt(self, attempt, reason):
+        from django.utils import timezone
+        from django.db import transaction
+        
+        logger = logging.getLogger(__name__)
+        
+        try:
             with transaction.atomic():
+                attempt.refresh_from_db()
+                
+                if attempt.status not in ['in_progress', 'paused']:
+                    logger.info(f"Attempt {attempt.id} is not in progress, skipping force submit")
+                    return
+                
+                now = timezone.now()
+                
                 attempt.status = 'submitted'
                 attempt.submitted_manually = False
                 attempt.auto_submit_reason = 'cheating'
                 attempt.is_cheating_detected = True
                 attempt.cheating_reason = reason
-                attempt.submit_time = timezone.now()
-                attempt.end_time = timezone.now()
+                attempt.submit_time = now
+                attempt.end_time = now
                 
                 if attempt.start_time:
                     attempt.time_spent = int(
@@ -1205,3 +1415,8 @@ class AntiCheatingBeaconView(generics.GenericAPIView):
                     severity='high',
                     action_taken='forced_submit'
                 )
+                
+                logger.info(f"Attempt {attempt.id} force submitted from Beacon: {reason}")
+        
+        except Exception as e:
+            logger.error(f"Failed to force submit attempt from beacon: {str(e)}", exc_info=True)
