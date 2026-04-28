@@ -290,6 +290,14 @@ class AssignmentSubmission(models.Model):
     submitted_at = models.DateTimeField(null=True, blank=True, verbose_name='提交时间')
     created_at = models.DateTimeField(auto_now_add=True, verbose_name='创建时间')
     updated_at = models.DateTimeField(auto_now=True, verbose_name='更新时间')
+    
+    submission_hash = models.CharField(
+        max_length=64,
+        null=True,
+        blank=True,
+        verbose_name='提交内容哈希',
+        help_text='用于幂等性校验'
+    )
 
     class Meta:
         verbose_name = '作业提交'
@@ -299,6 +307,7 @@ class AssignmentSubmission(models.Model):
         indexes = [
             models.Index(fields=['assignment', 'submission_status']),
             models.Index(fields=['student', '-submitted_at']),
+            models.Index(fields=['submission_hash']),
         ]
 
     def __str__(self):

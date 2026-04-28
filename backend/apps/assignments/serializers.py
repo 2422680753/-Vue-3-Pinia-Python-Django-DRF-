@@ -108,6 +108,21 @@ class AssignmentCreateSerializer(serializers.ModelSerializer):
             'allow_resubmission', 'max_resubmissions', 'status'
         ]
 
+    def validate(self, data):
+        start_time = data.get('start_time')
+        deadline = data.get('deadline')
+        late_deadline = data.get('late_deadline')
+        
+        if start_time and deadline:
+            if start_time >= deadline:
+                raise serializers.ValidationError('开始时间必须早于截止时间')
+        
+        if late_deadline and deadline:
+            if late_deadline <= deadline:
+                raise serializers.ValidationError('迟交截止时间必须晚于截止时间')
+        
+        return data
+
     def create(self, validated_data):
         validated_data['teacher'] = self.context['request'].user
         return super().create(validated_data)
@@ -190,18 +205,29 @@ class SubmissionVersionSerializer(serializers.ModelSerializer):
 
 
 class AssignmentSubmissionCreateSerializer(serializers.Serializer):
+    assignment_id = serializers.IntegerField(required=True)
     text_answer = serializers.CharField(required=False, allow_blank=True, allow_null=True)
     answers = AnswerResponseSubmitSerializer(many=True, required=False, allow_empty=True)
-    files = serializers.ListField(
-        child=serializers.FileField(),
-        required=False,
-        allow_empty=True
-    )
+    request_id = serializers.CharField(required=False, allow_blank=True, max_length=100)
+
+    def validate_answers(self, value):
+        seen_question_ids = set()
+        for ans in value:
+            qid = ans.get('question_id')
+            if qid in seen_question_ids:
+                raise serializers.ValidationError(f'题目ID {qid} 重复')
+            seen_question_ids.add(qid)
+        return value
 
 
 class GradingSerializer(serializers.Serializer):
-    total_score = serializers.DecimalField(max_digits=5, decimal_places=2, required=False)
-    penalty_score = serializers.DecimalField(max_digits=5, decimal_places=2, default=0, required=False)
+    request_id = serializers.CharField(required=False, allow_blank=True, max_length=100)
+    total_score = serializers.DecimalField(
+        max_digits=5, decimal_places=2, required=False, allow_null=True
+    )
+    penalty_score = serializers.DecimalField(
+        max_digits=5, decimal_places=2, default=0, required=False
+    )
     feedback = serializers.CharField(required=False, allow_blank=True, allow_null=True)
     comments = serializers.ListField(
         child=serializers.DictField(),
@@ -213,4 +239,23 @@ class GradingSerializer(serializers.Serializer):
         required=False,
         allow_empty=True
     )
+    is_returned = serializers.BooleanField(default=False, required=False)
+
+
+class BatchGradeItemSerializer(serializers.Serializer):
+    submission_id = serializers.IntegerField(required=True)
+    total_score = serializers.DecimalField(
+        max_digits=5, decimal_places=2, required=True
+    )
+    feedback = serializers.CharField(required=False, allow_blank=True, allow_null=True)
+    question_scores = serializers.DictField(
+        child=serializers.DecimalField(max_digits=5, decimal_places=2),
+        required=False,
+        allow_empty=True
+    )
+
+
+class BatchGradeSerializer(serializers.Serializer):
+    request_id = serializers.CharField(required=False, allow_blank=True, max_length=100)
+    grades = BatchGradeItemSerializer(many=True, required=True)
     is_returned = serializers.BooleanField(default=False, required=False)

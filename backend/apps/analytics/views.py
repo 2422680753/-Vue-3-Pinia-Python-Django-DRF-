@@ -10,6 +10,9 @@ from django.db.models.functions import TruncDate, TruncWeek, TruncMonth
 from datetime import timedelta, datetime, date
 import statistics
 from collections import defaultdict
+import logging
+
+logger = logging.getLogger(__name__)
 
 from .models import (
     LearningSession, DailyLearningStats, CourseProgressStats,
@@ -63,128 +66,190 @@ class LearningSessionViewSet(viewsets.ModelViewSet):
 
     @action(detail=False, methods=['post'], permission_classes=[IsStudent])
     def start(self, request):
+        """开始学习会话"""
         serializer = LearningSessionStartSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         
-        course_id = serializer.validated_data['course_id']
-        lesson_id = serializer.validated_data.get('lesson_id')
-        session_type = serializer.validated_data['session_type']
-        
-        from apps.courses.models import Course
         try:
-            course = Course.objects.get(id=course_id)
-        except Course.DoesNotExist:
+            course_id = serializer.validated_data['course_id']
+            lesson_id = serializer.validated_data.get('lesson_id')
+            session_type = serializer.validated_data['session_type']
+            request_id = request.data.get('request_id')
+            
+            from apps.courses.models import Course
+            try:
+                course = Course.objects.get(id=course_id)
+            except Course.DoesNotExist:
+                return Response(
+                    {'error': '课程不存在'},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+            
+            with transaction.atomic():
+                CourseEnrollment.objects.get_or_create(
+                    student=request.user,
+                    course=course,
+                    defaults={'role': 'student', 'is_active': True}
+                )
+                
+                active_sessions = LearningSession.objects.select_for_update().filter(
+                    student=request.user,
+                    is_active=True
+                )
+                
+                for session in active_sessions:
+                    session.is_active = False
+                    session.end_time = timezone.now()
+                    if session.start_time:
+                        session.duration = int(
+                            (session.end_time - session.start_time).total_seconds()
+                        )
+                    session.save()
+                
+                session = LearningSession.objects.create(
+                    student=request.user,
+                    course=course,
+                    lesson_id=lesson_id,
+                    session_type=session_type,
+                    start_time=timezone.now(),
+                    is_active=True,
+                    device_info=request.META.get('HTTP_USER_AGENT', 'unknown')[:500],
+                    ip_address=request.META.get('REMOTE_ADDR', 'unknown')
+                )
+            
+            logger.info(
+                f'User {request.user.id} started learning session {session.id} '
+                f'for course {course_id}'
+            )
+            
             return Response(
-                {'error': '课程不存在'},
-                status=status.HTTP_400_BAD_REQUEST
+                LearningSessionSerializer(session).data,
+                status=status.HTTP_201_CREATED
             )
         
-        CourseEnrollment.objects.get_or_create(
-            student=request.user,
-            course=course,
-            defaults={'role': 'student', 'is_active': True}
-        )
-        
-        active_sessions = LearningSession.objects.filter(
-            student=request.user,
-            is_active=True
-        )
-        for session in active_sessions:
-            session.is_active = False
-            session.end_time = timezone.now()
-            if session.start_time:
-                session.duration = int((session.end_time - session.start_time).total_seconds())
-            session.save()
-        
-        session = LearningSession.objects.create(
-            student=request.user,
-            course=course,
-            lesson_id=lesson_id,
-            session_type=session_type,
-            start_time=timezone.now(),
-            is_active=True,
-            device_info=request.META.get('HTTP_USER_AGENT', 'unknown'),
-            ip_address=request.META.get('REMOTE_ADDR', 'unknown')
-        )
-        
-        return Response(
-            LearningSessionSerializer(session).data,
-            status=status.HTTP_201_CREATED
-        )
+        except Exception as e:
+            logger.error(
+                f'Error starting learning session for user {request.user.id}: {str(e)}',
+                exc_info=True
+            )
+            return Response(
+                {'error': '开始学习会话时发生错误'},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
 
     @action(detail=True, methods=['post'])
     def update_session(self, request, pk=None):
+        """更新学习会话"""
         session = self.get_object()
         
-        if session.student != request.user:
-            return Response(
-                {'error': '无权限操作此会话'},
-                status=status.HTTP_403_FORBIDDEN
+        try:
+            if session.student != request.user:
+                return Response(
+                    {'error': '无权限操作此会话'},
+                    status=status.HTTP_403_FORBIDDEN
+                )
+            
+            if not session.is_active:
+                return Response(
+                    {'error': '会话已结束，无法更新'},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+            
+            serializer = LearningSessionUpdateSerializer(data=request.data)
+            serializer.is_valid(raise_exception=True)
+            
+            data = serializer.validated_data
+            
+            with transaction.atomic():
+                if 'focus_score' in data:
+                    session.focus_score = data['focus_score']
+                if 'efficiency_score' in data:
+                    session.efficiency_score = data['efficiency_score']
+                if 'interactions' in data:
+                    session.interactions.extend(data['interactions'][-100:])
+                if 'focus_intervals' in data:
+                    session.focus_intervals.extend(data['focus_intervals'][-50:])
+                if 'distraction_events' in data:
+                    session.distraction_events.extend(data['distraction_events'][-30:])
+                
+                session.save()
+            
+            logger.debug(
+                f'User {request.user.id} updated learning session {session.id}'
             )
+            
+            return Response(LearningSessionSerializer(session).data)
         
-        serializer = LearningSessionUpdateSerializer(data=request.data)
-        serializer.is_valid(raise_exception=True)
-        
-        data = serializer.validated_data
-        
-        if 'focus_score' in data:
-            session.focus_score = data['focus_score']
-        if 'efficiency_score' in data:
-            session.efficiency_score = data['efficiency_score']
-        if 'interactions' in data:
-            session.interactions.extend(data['interactions'])
-        if 'focus_intervals' in data:
-            session.focus_intervals.extend(data['focus_intervals'])
-        if 'distraction_events' in data:
-            session.distraction_events.extend(data['distraction_events'])
-        
-        session.save()
-        
-        return Response(LearningSessionSerializer(session).data)
+        except Exception as e:
+            logger.error(
+                f'Error updating learning session {pk} for user {request.user.id}: {str(e)}',
+                exc_info=True
+            )
+            return Response(
+                {'error': '更新学习会话时发生错误'},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
 
     @action(detail=True, methods=['post'])
     def end(self, request, pk=None):
+        """结束学习会话"""
         session = self.get_object()
         
-        if session.student != request.user:
+        try:
+            if session.student != request.user:
+                return Response(
+                    {'error': '无权限操作此会话'},
+                    status=status.HTTP_403_FORBIDDEN
+                )
+            
+            with transaction.atomic():
+                session = LearningSession.objects.select_for_update().get(id=session.id)
+                
+                if not session.is_active:
+                    return Response(LearningSessionSerializer(session).data)
+                
+                end_time = timezone.now()
+                
+                session.is_active = False
+                session.end_time = end_time
+                if session.start_time:
+                    session.duration = int((end_time - session.start_time).total_seconds())
+                
+                if session.focus_intervals:
+                    effective_seconds = sum(
+                        interval.get('duration', 0) for interval in session.focus_intervals
+                    )
+                    session.effective_duration = effective_seconds
+                
+                if session.duration and session.duration > 0:
+                    focus_intervals = session.focus_intervals
+                    if focus_intervals:
+                        avg_focus = sum(
+                            interval.get('focus_score', 0.5) for interval in focus_intervals
+                        ) / len(focus_intervals)
+                        session.focus_score = round(avg_focus, 2)
+                
+                session.save()
+                
+                self._update_daily_stats(request.user, session)
+                self._update_course_progress(request.user, session.course)
+            
+            logger.info(
+                f'User {request.user.id} ended learning session {session.id}, '
+                f'duration: {session.duration}s'
+            )
+            
+            return Response(LearningSessionSerializer(session).data)
+        
+        except Exception as e:
+            logger.error(
+                f'Error ending learning session {pk} for user {request.user.id}: {str(e)}',
+                exc_info=True
+            )
             return Response(
-                {'error': '无权限操作此会话'},
-                status=status.HTTP_403_FORBIDDEN
+                {'error': '结束学习会话时发生错误'},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
             )
-        
-        if not session.is_active:
-            return Response(
-                {'error': '会话已结束'},
-                status=status.HTTP_400_BAD_REQUEST
-            )
-        
-        end_time = timezone.now()
-        
-        session.is_active = False
-        session.end_time = end_time
-        if session.start_time:
-            session.duration = int((end_time - session.start_time).total_seconds())
-        
-        if session.focus_intervals:
-            effective_seconds = sum(
-                interval.get('duration', 0) for interval in session.focus_intervals
-            )
-            session.effective_duration = effective_seconds
-        
-        if session.duration and session.duration > 0:
-            focus_intervals = session.focus_intervals
-            if focus_intervals:
-                avg_focus = sum(
-                    interval.get('focus_score', 0.5) for interval in focus_intervals
-                ) / len(focus_intervals)
-                session.focus_score = round(avg_focus, 2)
-        
-        session.save()
-        
-        self._update_daily_stats(request.user, session)
-        self._update_course_progress(request.user, session.course)
-        
-        return Response(LearningSessionSerializer(session).data)
 
     def _update_daily_stats(self, user, session):
         today = timezone.now().date()
