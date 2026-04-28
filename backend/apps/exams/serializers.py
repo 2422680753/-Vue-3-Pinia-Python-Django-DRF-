@@ -1,4 +1,5 @@
 from rest_framework import serializers
+from django.utils import timezone
 from .models import (
     Exam, QuestionBank, ExamQuestion, ExamAttempt,
     ExamAnswer, CheatingRecord, ExamActivityLog
@@ -144,9 +145,40 @@ class ExamCreateSerializer(serializers.ModelSerializer):
             'enable_face_verification', 'verify_interval', 'password'
         ]
 
+    def validate(self, data):
+        start_time = data.get('start_time')
+        end_time = data.get('end_time')
+        duration = data.get('duration')
+        
+        if start_time and end_time:
+            if start_time >= end_time:
+                raise serializers.ValidationError('开始时间必须早于结束时间')
+            
+            actual_duration = int((end_time - start_time).total_seconds() / 60)
+            if duration and actual_duration != duration:
+                pass
+        
+        total_score = data.get('total_score', 100)
+        pass_score = data.get('pass_score', 60)
+        if pass_score > total_score:
+            raise serializers.ValidationError('及格分数不能大于总分')
+        
+        return data
+
     def create(self, validated_data):
         validated_data['teacher'] = self.context['request'].user
+        if validated_data.get('status') == 'published':
+            validated_data['published_at'] = timezone.now()
         return super().create(validated_data)
+
+    def update(self, instance, validated_data):
+        old_status = instance.status
+        new_status = validated_data.get('status')
+        
+        if new_status == 'published' and old_status != 'published':
+            validated_data['published_at'] = timezone.now()
+        
+        return super().update(instance, validated_data)
 
 
 class ExamAnswerSerializer(serializers.ModelSerializer):
@@ -170,7 +202,12 @@ class ExamAnswerSubmitSerializer(serializers.Serializer):
     )
     is_skipped = serializers.BooleanField(default=False, required=False)
     is_flagged = serializers.BooleanField(default=False, required=False)
-    time_spent = serializers.IntegerField(required=False, allow_null=True)
+    time_spent = serializers.IntegerField(required=False, allow_null=True, min_value=0)
+
+
+class ExamAnswerBatchSubmitSerializer(serializers.Serializer):
+    request_id = serializers.CharField(required=False, allow_blank=True, max_length=100)
+    answers = ExamAnswerSubmitSerializer(many=True, required=True)
 
 
 class ExamAttemptSerializer(serializers.ModelSerializer):
@@ -219,3 +256,27 @@ class AntiCheatingEventSerializer(serializers.Serializer):
 class ExamStartSerializer(serializers.Serializer):
     exam_id = serializers.IntegerField(required=True)
     password = serializers.CharField(required=False, allow_blank=True, allow_null=True)
+    request_id = serializers.CharField(required=False, allow_blank=True, max_length=100)
+
+
+class ExamGradeItemSerializer(serializers.Serializer):
+    attempt_id = serializers.IntegerField(required=True)
+    total_score = serializers.DecimalField(
+        max_digits=5, decimal_places=2, required=True, min_value=0
+    )
+    feedback = serializers.CharField(required=False, allow_blank=True, allow_null=True)
+    question_scores = serializers.DictField(
+        child=serializers.DecimalField(max_digits=5, decimal_places=2, min_value=0),
+        required=False,
+        allow_empty=True
+    )
+
+
+class ExamBatchGradeSerializer(serializers.Serializer):
+    request_id = serializers.CharField(required=False, allow_blank=True, max_length=100)
+    grades = ExamGradeItemSerializer(many=True, required=True)
+
+
+class ExamSubmitSerializer(serializers.Serializer):
+    request_id = serializers.CharField(required=False, allow_blank=True, max_length=100)
+    answers = ExamAnswerSubmitSerializer(many=True, required=False)

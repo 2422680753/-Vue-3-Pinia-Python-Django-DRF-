@@ -42,9 +42,15 @@ class ExamMonitoringConsumer(AsyncWebsocketConsumer):
         )
         
         self.tab_switch_count = 0
+        self.copy_attempts = 0
+        self.paste_attempts = 0
+        self.fullscreen_exits = 0
+        self.idle_violations = 0
+        self.total_violations = 0
         self.idle_start_time = None
         self.last_activity_time = timezone.now()
         self.in_fullscreen = True
+        self.is_force_submitting = False
         
         await self.accept()
         
@@ -70,7 +76,10 @@ class ExamMonitoringConsumer(AsyncWebsocketConsumer):
             )
         
         if hasattr(self, 'attempt') and self.attempt.status == 'in_progress':
-            await self.log_activity('disconnect', {'close_code': close_code})
+            await self.log_activity('websocket_disconnect', {
+                'close_code': close_code,
+                'timestamp': timezone.now().isoformat()
+            })
 
     async def receive(self, text_data):
         try:
@@ -97,6 +106,15 @@ class ExamMonitoringConsumer(AsyncWebsocketConsumer):
     async def handle_heartbeat(self, data):
         self.last_activity_time = timezone.now()
         
+        violation_state = data.get('violation_state', {}) if data else {}
+        if violation_state:
+            self.tab_switch_count = violation_state.get('tabSwitchCount', self.tab_switch_count)
+            self.copy_attempts = violation_state.get('copyAttempts', self.copy_attempts)
+            self.paste_attempts = violation_state.get('pasteAttempts', self.paste_attempts)
+            self.fullscreen_exits = violation_state.get('fullscreenExits', self.fullscreen_exits)
+            self.idle_violations = violation_state.get('idleViolations', self.idle_violations)
+            self.total_violations = violation_state.get('totalViolations', self.total_violations)
+        
         if self.idle_start_time:
             idle_duration = (timezone.now() - self.idle_start_time).total_seconds()
             max_idle_time = self.exam.get_max_idle_time()
@@ -105,12 +123,17 @@ class ExamMonitoringConsumer(AsyncWebsocketConsumer):
                 await self.record_cheating(
                     cheating_type='idle_too_long',
                     description=f'长时间空闲，空闲时长: {idle_duration:.1f}秒',
-                    severity='medium'
+                    severity='medium',
+                    evidence={'idle_duration': idle_duration, 'max_allowed': max_idle_time}
                 )
+                self.idle_violations += 1
+                self.total_violations += 1
         
         self.idle_start_time = None
         
-        await self.log_activity('heartbeat', {})
+        await self.log_activity('heartbeat', {
+            'timestamp': timezone.now().isoformat()
+        })
 
     async def handle_activity(self, data):
         if not data:
@@ -135,11 +158,12 @@ class ExamMonitoringConsumer(AsyncWebsocketConsumer):
         now = timezone.now()
         
         if event_type == 'tab_leave':
-            self.tab_switch_count += 1
+            self.tab_switch_count = details.get('count', self.tab_switch_count + 1)
+            self.total_violations += 1
             await self.log_activity('tab_leave', details)
             
             max_switches = self.exam.get_max_tab_switches()
-            if self.tab_switch_count > max_switches:
+            if self.tab_switch_count >= max_switches:
                 await self.record_cheating(
                     cheating_type='tab_switch',
                     description=f'切出页面次数超过限制: {self.tab_switch_count}次',
@@ -147,6 +171,10 @@ class ExamMonitoringConsumer(AsyncWebsocketConsumer):
                     evidence={'tab_switch_count': self.tab_switch_count, 'max_allowed': max_switches}
                 )
                 await self.force_submit('cheating')
+            else:
+                await self.send_warning(
+                    f'检测到切出页面，剩余切出次数: {max_switches - self.tab_switch_count}'
+                )
         
         elif event_type == 'tab_return':
             await self.log_activity('tab_return', details)
@@ -154,11 +182,14 @@ class ExamMonitoringConsumer(AsyncWebsocketConsumer):
         elif event_type == 'fullscreen_exit':
             if self.exam.require_fullscreen:
                 self.in_fullscreen = False
+                self.fullscreen_exits = details.get('count', self.fullscreen_exits + 1)
+                self.total_violations += 1
                 await self.log_activity('fullscreen_exit', details)
                 await self.record_cheating(
                     cheating_type='fullscreen_exit',
                     description='考试期间退出全屏模式',
-                    severity='medium'
+                    severity='medium',
+                    evidence={'count': self.fullscreen_exits}
                 )
         
         elif event_type == 'fullscreen_enter':
@@ -167,27 +198,48 @@ class ExamMonitoringConsumer(AsyncWebsocketConsumer):
         
         elif event_type == 'copy_attempt':
             if self.exam.block_copy_paste:
+                self.copy_attempts = details.get('count', self.copy_attempts + 1)
+                self.total_violations += 1
                 await self.log_activity('copy_attempt', details)
                 await self.record_cheating(
                     cheating_type='copy_attempt',
                     description='考试期间尝试复制内容',
                     severity='low',
-                    evidence=details
+                    evidence={'count': self.copy_attempts}
                 )
         
         elif event_type == 'paste_attempt':
             if self.exam.block_copy_paste:
+                self.paste_attempts = details.get('count', self.paste_attempts + 1)
+                self.total_violations += 1
                 await self.log_activity('paste_attempt', details)
                 await self.record_cheating(
                     cheating_type='paste_attempt',
                     description='考试期间尝试粘贴内容',
                     severity='low',
-                    evidence=details
+                    evidence={'count': self.paste_attempts}
                 )
         
         elif event_type == 'right_click':
             if self.exam.block_right_click:
                 await self.log_activity('right_click', details)
+        
+        elif event_type in ['refresh_attempt', 'print_attempt', 'save_attempt']:
+            severity = 'medium' if event_type == 'refresh_attempt' else 'low'
+            descriptions = {
+                'refresh_attempt': '考试期间尝试刷新页面',
+                'print_attempt': '考试期间尝试打印页面',
+                'save_attempt': '考试期间尝试保存页面'
+            }
+            
+            self.total_violations += 1
+            await self.log_activity(event_type, details)
+            await self.record_cheating(
+                cheating_type=event_type,
+                description=descriptions.get(event_type, '检测到可疑行为'),
+                severity=severity,
+                evidence=details
+            )
         
         elif event_type == 'idle_start':
             self.idle_start_time = now
@@ -199,6 +251,8 @@ class ExamMonitoringConsumer(AsyncWebsocketConsumer):
                 max_idle_time = self.exam.get_max_idle_time()
                 
                 if idle_duration > max_idle_time:
+                    self.idle_violations += 1
+                    self.total_violations += 1
                     await self.record_cheating(
                         cheating_type='idle_too_long',
                         description=f'长时间空闲，空闲时长: {idle_duration:.1f}秒',
@@ -207,9 +261,12 @@ class ExamMonitoringConsumer(AsyncWebsocketConsumer):
                     )
             
             self.idle_start_time = None
-            await self.log_activity('idle_end', {'idle_duration': (now - self.idle_start_time).total_seconds() if self.idle_start_time else 0})
+            await self.log_activity('idle_end', {
+                'idle_duration': (now - self.idle_start_time).total_seconds() if self.idle_start_time else 0
+            })
         
         elif event_type == 'suspicious_behavior':
+            self.total_violations += 1
             await self.record_cheating(
                 cheating_type='suspicious_behavior',
                 description=details.get('description', '检测到可疑行为'),
@@ -217,14 +274,37 @@ class ExamMonitoringConsumer(AsyncWebsocketConsumer):
                 evidence=details
             )
         
+        await self.check_force_submit_condition()
+        
         await self.send(text_data=json.dumps({
             'type': 'anti_cheating_ack',
             'data': {
                 'event_type': event_type,
                 'tab_switch_count': self.tab_switch_count,
-                'max_tab_switches': self.exam.get_max_tab_switches()
+                'max_tab_switches': self.exam.get_max_tab_switches(),
+                'total_violations': self.total_violations
             }
         }))
+
+    async def check_force_submit_condition(self):
+        if self.is_force_submitting:
+            return
+        
+        max_violations = 10
+        max_tab_switches = self.exam.get_max_tab_switches()
+        
+        should_force_submit = False
+        reason = ''
+        
+        if self.tab_switch_count >= max_tab_switches:
+            should_force_submit = True
+            reason = f'切出页面次数超过限制({max_tab_switches}次)'
+        elif self.total_violations >= max_violations:
+            should_force_submit = True
+            reason = f'违规次数超过限制({max_violations}次)'
+        
+        if should_force_submit:
+            await self.force_submit('cheating', reason)
 
     async def handle_answer_update(self, data):
         if not data:
@@ -267,11 +347,22 @@ class ExamMonitoringConsumer(AsyncWebsocketConsumer):
                 severity='high',
                 evidence=verification_data
             )
-            await self.force_submit('cheating')
+            await self.force_submit('cheating', '人脸验证失败')
         
         await self.send(text_data=json.dumps({
             'type': 'face_verification_ack',
             'data': {'is_verified': is_verified}
+        }))
+
+    async def send_warning(self, message):
+        await self.send(text_data=json.dumps({
+            'type': 'warning',
+            'message': message,
+            'data': {
+                'tab_switch_count': self.tab_switch_count,
+                'max_tab_switches': self.exam.get_max_tab_switches(),
+                'total_violations': self.total_violations
+            }
         }))
 
     async def record_cheating(self, cheating_type, description, severity='medium', evidence=None):
@@ -288,7 +379,7 @@ class ExamMonitoringConsumer(AsyncWebsocketConsumer):
             evidence=evidence or {}
         )
         
-        high_severity_types = ['tab_switch', 'face_verify_fail']
+        high_severity_types = ['tab_switch', 'face_verify_fail', 'refresh_attempt']
         if severity == 'high' or cheating_type in high_severity_types:
             self.attempt.is_cheating_detected = True
             self.attempt.cheating_reason = description
@@ -344,17 +435,25 @@ class ExamMonitoringConsumer(AsyncWebsocketConsumer):
             answer.is_answered = bool(answer.answer_text or answer.answer_choice)
             answer.save()
 
-    async def force_submit(self, reason):
-        await database_sync_to_async(self._force_submit_sync)(reason)
+    async def force_submit(self, reason, description=None):
+        if self.is_force_submitting:
+            return
+        
+        self.is_force_submitting = True
+        
+        await database_sync_to_async(self._force_submit_sync)(reason, description)
         
         await self.send(text_data=json.dumps({
             'type': 'force_submit',
-            'data': {'reason': reason}
+            'data': {
+                'reason': reason,
+                'description': description or '系统检测到违规行为'
+            }
         }))
         
         await self.close(code=1000)
 
-    def _force_submit_sync(self, reason):
+    def _force_submit_sync(self, reason, description):
         from django.utils import timezone
         
         self.attempt.status = 'submitted'
@@ -364,9 +463,21 @@ class ExamMonitoringConsumer(AsyncWebsocketConsumer):
         self.attempt.end_time = timezone.now()
         
         if self.attempt.start_time:
-            self.attempt.time_spent = int((self.attempt.end_time - self.attempt.start_time).total_seconds())
+            self.attempt.time_spent = int(
+                (self.attempt.end_time - self.attempt.start_time).total_seconds()
+            )
         
+        self.attempt.is_cheating_detected = True
+        self.attempt.cheating_reason = description or f'自动提交原因: {reason}'
         self.attempt.save()
+        
+        CheatingRecord.objects.create(
+            attempt=self.attempt,
+            cheating_type='auto_submit',
+            description=description or f'系统自动提交，原因: {reason}',
+            severity='high',
+            action_taken='forced_submit'
+        )
 
     @database_sync_to_async
     def get_attempt(self, attempt_id):
