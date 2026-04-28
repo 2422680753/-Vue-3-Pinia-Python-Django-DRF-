@@ -6,6 +6,9 @@ from django_filters.rest_framework import DjangoFilterBackend
 from django.utils import timezone
 from django.db.models import Avg, Count, Sum
 from django.core.files.base import ContentFile
+from django.db import transaction
+import hashlib
+import logging
 
 from .models import (
     Assignment, AssignmentQuestion, GradingRubric,
@@ -18,13 +21,16 @@ from .serializers import (
     GradingRubricSerializer, AssignmentSubmissionSerializer,
     SubmissionFileSerializer, AnswerResponseSerializer,
     AssignmentSubmissionCreateSerializer, GradingSerializer,
-    GradingCommentSerializer, SubmissionVersionSerializer
+    GradingCommentSerializer, SubmissionVersionSerializer,
+    BatchGradeSerializer
 )
 from apps.courses.models import CourseEnrollment
 from edu_platform.permissions import (
     IsTeacher, IsStudent, IsCourseInstructor, IsAssignmentOwner,
     IsAdminUser
 )
+
+logger = logging.getLogger(__name__)
 
 
 class AssignmentViewSet(viewsets.ModelViewSet):
@@ -220,9 +226,17 @@ class AssignmentSubmissionViewSet(viewsets.ModelViewSet):
             submitted_at=submission.submitted_at if submission.submitted_at else timezone.now()
         )
 
+    def _generate_submission_hash(self, assignment_id, user_id, text_answer, answers_data=None):
+        content = f"{assignment_id}:{user_id}:{text_answer or ''}"
+        if answers_data:
+            content += ":" + str(sorted(str(a) for a in answers_data))
+        return hashlib.sha256(content.encode()).hexdigest()
+
     @action(detail=False, methods=['post'])
     def submit(self, request):
         assignment_id = request.data.get('assignment_id')
+        request_id = request.data.get('request_id')
+        
         if not assignment_id:
             return Response(
                 {'error': '请提供作业ID'},
@@ -257,98 +271,171 @@ class AssignmentSubmissionViewSet(viewsets.ModelViewSet):
                     status=status.HTTP_400_BAD_REQUEST
                 )
         
-        submission, created = AssignmentSubmission.objects.get_or_create(
-            assignment=assignment,
-            student=request.user,
-            defaults={
-                'submission_status': 'not_submitted',
-                'grading_status': 'pending'
-            }
-        )
-        
-        if not created and submission.submission_status in ['submitted', 'late', 'graded']:
-            if not assignment.allow_resubmission:
-                return Response(
-                    {'error': '该作业不允许重做提交'},
-                    status=status.HTTP_400_BAD_REQUEST
-                )
-            if submission.resubmission_count >= assignment.max_resubmissions:
-                return Response(
-                    {'error': f'最多只能重做{assignment.max_resubmissions}次'},
-                    status=status.HTTP_400_BAD_REQUEST
-                )
-        
-        self._save_version(submission)
-        
-        serializer = AssignmentSubmissionCreateSerializer(data=request.data)
-        serializer.is_valid(raise_exception=True)
-        
-        text_answer = serializer.validated_data.get('text_answer')
-        answers_data = serializer.validated_data.get('answers', [])
-        
-        submission.text_answer = text_answer
-        
-        is_late = assignment.deadline and now > assignment.deadline
-        submission.is_late = is_late
-        submission.submission_status = 'late' if is_late else 'submitted'
-        submission.grading_status = 'pending'
-        submission.submitted_at = now
-        
-        if not created and submission.submission_status in ['submitted', 'late']:
-            submission.resubmission_count += 1
-        
-        submission.save()
-        
-        if answers_data:
-            AnswerResponse.objects.filter(submission=submission).delete()
-            for ans_data in answers_data:
-                try:
-                    question = AssignmentQuestion.objects.get(
-                        id=ans_data.get('question_id'),
-                        assignment=assignment
+        if assignment.text_answer_required:
+            text_answer = request.data.get('text_answer', '')
+            if not text_answer or not text_answer.strip():
+                if not assignment.allows_file_upload:
+                    return Response(
+                        {'error': '文字作答为必填项'},
+                        status=status.HTTP_400_BAD_REQUEST
                     )
-                    AnswerResponse.objects.create(
-                        submission=submission,
-                        question=question,
-                        answer_text=ans_data.get('answer_text'),
-                        answer_choice=ans_data.get('answer_choice', [])
-                    )
-                except AssignmentQuestion.DoesNotExist:
-                    continue
         
         files = request.FILES.getlist('files')
-        if files and assignment.allows_file_upload:
-            SubmissionFile.objects.filter(submission=submission).delete()
-            for file_obj in files[:assignment.max_file_count]:
-                file_type = file_obj.name.split('.')[-1].lower() if '.' in file_obj.name else ''
-                
-                if assignment.allowed_file_types and file_type not in assignment.allowed_file_types:
-                    continue
-                
-                file_size = file_obj.size
-                if file_size > assignment.max_file_size * 1024 * 1024:
-                    continue
-                
-                SubmissionFile.objects.create(
-                    submission=submission,
-                    file=file_obj,
-                    filename=file_obj.name,
-                    file_size=file_size,
-                    file_type=file_type
-                )
+        if not files and assignment.allows_file_upload and not assignment.allows_text_answer:
+            return Response(
+                {'error': '请上传作业文件'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
         
-        return Response(
-            AssignmentSubmissionSerializer(submission, context={'request': request}).data,
-            status=status.HTTP_201_CREATED
-        )
+        if files and assignment.allows_file_upload:
+            if len(files) > assignment.max_file_count:
+                return Response(
+                    {'error': f'最多只能上传{assignment.max_file_count}个文件'},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+            
+            for file_obj in files:
+                file_type = file_obj.name.split('.')[-1].lower() if '.' in file_obj.name else ''
+                if assignment.allowed_file_types and file_type not in assignment.allowed_file_types:
+                    return Response(
+                        {'error': f'不支持的文件类型: {file_type}. 支持的类型: {", ".join(assignment.allowed_file_types)}'},
+                        status=status.HTTP_400_BAD_REQUEST
+                    )
+                
+                if file_obj.size > assignment.max_file_size * 1024 * 1024:
+                    return Response(
+                        {'error': f'文件大小超过限制: {file_obj.name}. 最大允许: {assignment.max_file_size}MB'},
+                        status=status.HTTP_400_BAD_REQUEST
+                    )
+        
+        try:
+            with transaction.atomic():
+                submission, created = AssignmentSubmission.objects.select_for_update().get_or_create(
+                    assignment=assignment,
+                    student=request.user,
+                    defaults={
+                        'submission_status': 'not_submitted',
+                        'grading_status': 'pending'
+                    }
+                )
+                
+                if not created and submission.submission_status in ['submitted', 'late', 'graded']:
+                    if not assignment.allow_resubmission:
+                        return Response(
+                            {'error': '该作业不允许重做提交'},
+                            status=status.HTTP_400_BAD_REQUEST
+                        )
+                    if submission.resubmission_count >= assignment.max_resubmissions:
+                        return Response(
+                            {'error': f'最多只能重做{assignment.max_resubmissions}次'},
+                            status=status.HTTP_400_BAD_REQUEST
+                        )
+                
+                if not created:
+                    self._save_version(submission)
+                
+                serializer = AssignmentSubmissionCreateSerializer(data=request.data)
+                serializer.is_valid(raise_exception=True)
+                
+                text_answer = serializer.validated_data.get('text_answer')
+                answers_data = serializer.validated_data.get('answers', [])
+                
+                submission_hash = self._generate_submission_hash(
+                    assignment.id,
+                    request.user.id,
+                    text_answer,
+                    answers_data
+                )
+                
+                submission.text_answer = text_answer
+                
+                is_late = assignment.deadline and now > assignment.deadline
+                submission.is_late = is_late
+                submission.submission_status = 'late' if is_late else 'submitted'
+                submission.grading_status = 'pending'
+                submission.submitted_at = now
+                submission.submission_hash = submission_hash
+                
+                if not created and submission.submission_status in ['submitted', 'late']:
+                    submission.resubmission_count += 1
+                
+                submission.save()
+                
+                if answers_data:
+                    AnswerResponse.objects.filter(submission=submission).delete()
+                    for ans_data in answers_data:
+                        try:
+                            question = AssignmentQuestion.objects.get(
+                                id=ans_data.get('question_id'),
+                                assignment=assignment
+                            )
+                            
+                            answer_choice = ans_data.get('answer_choice', [])
+                            if question.question_type == 'single_choice' and len(answer_choice) > 1:
+                                continue
+                            
+                            AnswerResponse.objects.create(
+                                submission=submission,
+                                question=question,
+                                answer_text=ans_data.get('answer_text'),
+                                answer_choice=answer_choice
+                            )
+                        except AssignmentQuestion.DoesNotExist:
+                            continue
+                
+                if files and assignment.allows_file_upload:
+                    SubmissionFile.objects.filter(submission=submission).delete()
+                    for file_obj in files[:assignment.max_file_count]:
+                        file_type = file_obj.name.split('.')[-1].lower() if '.' in file_obj.name else ''
+                        
+                        if assignment.allowed_file_types and file_type not in assignment.allowed_file_types:
+                            continue
+                        
+                        file_size = file_obj.size
+                        if file_size > assignment.max_file_size * 1024 * 1024:
+                            continue
+                        
+                        SubmissionFile.objects.create(
+                            submission=submission,
+                            file=file_obj,
+                            filename=file_obj.name,
+                            file_size=file_size,
+                            file_type=file_type
+                        )
+            
+            return Response(
+                AssignmentSubmissionSerializer(submission, context={'request': request}).data,
+                status=status.HTTP_201_CREATED
+            )
+            
+        except Exception as e:
+            logger.error(f'Submission error: {str(e)}', exc_info=True)
+            return Response(
+                {'error': '提交失败，请重试'},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
 
     @action(detail=True, methods=['post'], permission_classes=[IsTeacher | IsAdminUser])
     def grade(self, request, pk=None):
         submission = self.get_object()
         assignment = submission.assignment
         
+        if submission.submission_status not in ['submitted', 'late', 'returned']:
+            return Response(
+                {'error': '该作业不可批改'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        if submission.grading_status == 'completed':
+            return Response(
+                {'error': '该作业已批改完成'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
         serializer = GradingSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
+        
+        request_id = serializer.validated_data.get('request_id')
         
         total_score = serializer.validated_data.get('total_score')
         penalty_score = serializer.validated_data.get('penalty_score', 0)
@@ -357,30 +444,45 @@ class AssignmentSubmissionViewSet(viewsets.ModelViewSet):
         question_scores = serializer.validated_data.get('question_scores', {})
         is_returned = serializer.validated_data.get('is_returned', False)
         
-        for question_id, score in question_scores.items():
-            try:
-                answer = AnswerResponse.objects.get(
-                    submission=submission,
-                    question_id=question_id
+        if total_score is not None:
+            if total_score < 0 or total_score > assignment.total_score:
+                return Response(
+                    {'error': f'分数应在0到{assignment.total_score}之间'},
+                    status=status.HTTP_400_BAD_REQUEST
                 )
-                answer.score = score
-                answer.feedback = feedback
-                answer.save()
-            except AnswerResponse.DoesNotExist:
-                continue
         
-        if total_score is None:
-            answer_scores = submission.answers.exclude(score__isnull=True).values_list('score', flat=True)
-            total_score = sum(answer_scores) if answer_scores else 0
-        
-        if submission.is_late and assignment.late_submission_penalty > 0:
-            days_late = (submission.submitted_at - assignment.deadline).days if assignment.deadline else 0
-            if days_late > 0:
-                penalty = min(
-                    assignment.total_score * assignment.late_submission_penalty * days_late,
-                    total_score
-                )
-                penalty_score = max(penalty_score, penalty)
+        try:
+            with transaction.atomic():
+                for question_id, score in question_scores.items():
+                    if score < 0:
+                        return Response(
+                            {'error': '题目分数不能为负数'},
+                            status=status.HTTP_400_BAD_REQUEST
+                        )
+                    
+                    try:
+                        answer = AnswerResponse.objects.get(
+                            submission=submission,
+                            question_id=question_id
+                        )
+                        answer.score = score
+                        answer.feedback = feedback
+                        answer.save()
+                    except AnswerResponse.DoesNotExist:
+                        continue
+                
+                if total_score is None:
+                    answer_scores = submission.answers.exclude(score__isnull=True).values_list('score', flat=True)
+                    total_score = sum(answer_scores) if answer_scores else 0
+                
+                if submission.is_late and assignment.late_submission_penalty > 0:
+                    days_late = (submission.submitted_at - assignment.deadline).days if assignment.deadline else 0
+                    if days_late > 0:
+                        penalty = min(
+                            assignment.total_score * assignment.late_submission_penalty * days_late,
+                            total_score
+                        )
+                        penalty_score = max(penalty_score, penalty)
         
         submission.total_score = total_score
         submission.penalty_score = penalty_score

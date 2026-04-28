@@ -7,6 +7,10 @@ from django.utils import timezone
 from django.db.models import Avg, Count, Sum, Q
 from django.db import transaction
 import random
+import hashlib
+import logging
+
+logger = logging.getLogger(__name__)
 
 from .models import (
     Exam, QuestionBank, ExamQuestion, ExamAttempt,
@@ -18,7 +22,8 @@ from .serializers import (
     ExamQuestionSerializer, ExamAttemptSerializer,
     ExamAnswerSerializer, ExamAnswerSubmitSerializer,
     CheatingRecordSerializer, ExamActivityLogSerializer,
-    ExamStartSerializer, AntiCheatingEventSerializer
+    ExamStartSerializer, AntiCheatingEventSerializer,
+    ExamBatchGradeSerializer, ExamAnswerBatchSubmitSerializer
 )
 from apps.courses.models import CourseEnrollment
 from edu_platform.permissions import (
@@ -136,104 +141,140 @@ class ExamViewSet(viewsets.ModelViewSet):
         serializer = ExamStartSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         
-        now = timezone.now()
+        request_id = serializer.validated_data.get('request_id')
         
-        if exam.password:
-            provided_password = serializer.validated_data.get('password')
-            if provided_password != exam.password:
+        try:
+            now = timezone.now()
+            
+            if exam.password:
+                provided_password = serializer.validated_data.get('password')
+                if provided_password != exam.password:
+                    return Response(
+                        {'error': '考试密码错误'},
+                        status=status.HTTP_400_BAD_REQUEST
+                    )
+            
+            if exam.status != 'published':
                 return Response(
-                    {'error': '考试密码错误'},
+                    {'error': '考试未发布'},
                     status=status.HTTP_400_BAD_REQUEST
                 )
-        
-        if exam.status != 'published':
-            return Response(
-                {'error': '考试未发布'},
-                status=status.HTTP_400_BAD_REQUEST
-            )
-        
-        enter_allowed_time = exam.start_time - timezone.timedelta(minutes=exam.allow_enter_before)
-        if now < enter_allowed_time:
-            return Response(
-                {'error': f'考试还未开始，最早可提前{exam.allow_enter_before}分钟进入'},
-                status=status.HTTP_400_BAD_REQUEST
-            )
-        
-        if now > exam.end_time:
-            return Response(
-                {'error': '考试已结束'},
-                status=status.HTTP_400_BAD_REQUEST
-            )
-        
-        if now > exam.start_time and not exam.allow_late_enter:
-            return Response(
-                {'error': '考试已开始，不允许迟到进入'},
-                status=status.HTTP_400_BAD_REQUEST
-            )
-        
-        if now > exam.start_time and exam.allow_late_enter:
-            late_minutes = (now - exam.start_time).total_seconds() / 60
-            if exam.late_enter_limit and late_minutes > exam.late_enter_limit:
+            
+            enter_allowed_time = exam.start_time - timezone.timedelta(minutes=exam.allow_enter_before)
+            if now < enter_allowed_time:
                 return Response(
-                    {'error': f'迟到超过{exam.late_enter_limit}分钟，不允许进入'},
+                    {'error': f'考试还未开始，最早可提前{exam.allow_enter_before}分钟进入'},
                     status=status.HTTP_400_BAD_REQUEST
                 )
-        
-        existing_attempts = ExamAttempt.objects.filter(exam=exam, student=request.user)
-        if existing_attempts.count() >= exam.max_attempts:
-            return Response(
-                {'error': f'您已参加{exam.max_attempts}次考试，无法再次参加'},
-                status=status.HTTP_400_BAD_REQUEST
-            )
-        
-        in_progress_attempt = existing_attempts.filter(status='in_progress').first()
-        if in_progress_attempt:
-            return Response(
-                ExamAttemptSerializer(in_progress_attempt).data
-            )
-        
-        with transaction.atomic():
-            attempt_number = existing_attempts.count() + 1
             
-            attempt = ExamAttempt.objects.create(
-                exam=exam,
-                student=request.user,
-                attempt_number=attempt_number,
-                status='in_progress',
-                ip_address=request.META.get('REMOTE_ADDR', 'unknown'),
-                device_info=request.META.get('HTTP_USER_AGENT', 'unknown')
-            )
+            if now > exam.end_time:
+                return Response(
+                    {'error': '考试已结束'},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
             
-            questions = list(exam.exam_questions.all())
+            if now > exam.start_time and not exam.allow_late_enter:
+                return Response(
+                    {'error': '考试已开始，不允许迟到进入'},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
             
-            if exam.is_shuffle_questions:
-                random.shuffle(questions)
+            if now > exam.start_time and exam.allow_late_enter:
+                late_minutes = (now - exam.start_time).total_seconds() / 60
+                if exam.late_enter_limit and late_minutes > exam.late_enter_limit:
+                    return Response(
+                        {'error': f'迟到超过{exam.late_enter_limit}分钟，不允许进入'},
+                        status=status.HTTP_400_BAD_REQUEST
+                    )
             
-            attempt.shuffled_questions = [q.id for q in questions]
-            
-            if exam.is_shuffle_options:
-                shuffled_options = {}
-                for q in questions:
-                    if q.options:
-                        options = list(q.options)
-                        random.shuffle(options)
-                        shuffled_options[q.id] = [opt['value'] for opt in options]
-                attempt.shuffled_options = shuffled_options
-            
-            attempt.save()
-            
-            for question in questions:
-                ExamAnswer.objects.create(
+            with transaction.atomic():
+                existing_attempts = ExamAttempt.objects.select_for_update().filter(
+                    exam=exam,
+                    student=request.user
+                )
+                
+                in_progress_attempt = existing_attempts.filter(status='in_progress').first()
+                if in_progress_attempt:
+                    logger.info(
+                        f'User {request.user.id} returning to exam {exam.id}, '
+                        f'attempt {in_progress_attempt.id}'
+                    )
+                    return Response(ExamAttemptSerializer(in_progress_attempt).data)
+                
+                if existing_attempts.count() >= exam.max_attempts:
+                    return Response(
+                        {'error': f'您已参加{exam.max_attempts}次考试，无法再次参加'},
+                        status=status.HTTP_400_BAD_REQUEST
+                    )
+                
+                attempt_number = existing_attempts.count() + 1
+                
+                attempt = ExamAttempt.objects.create(
+                    exam=exam,
+                    student=request.user,
+                    attempt_number=attempt_number,
+                    status='in_progress',
+                    start_time=now,
+                    ip_address=request.META.get('REMOTE_ADDR', 'unknown'),
+                    device_info=request.META.get('HTTP_USER_AGENT', 'unknown')
+                )
+                
+                questions = list(exam.exam_questions.all())
+                
+                if exam.is_shuffle_questions:
+                    random.shuffle(questions)
+                
+                attempt.shuffled_questions = [q.id for q in questions]
+                
+                if exam.is_shuffle_options:
+                    shuffled_options = {}
+                    for q in questions:
+                        if q.options:
+                            options = list(q.options)
+                            random.shuffle(options)
+                            shuffled_options[q.id] = [opt['value'] for opt in options]
+                    attempt.shuffled_options = shuffled_options
+                
+                attempt.save()
+                
+                for question in questions:
+                    ExamAnswer.objects.create(
+                        attempt=attempt,
+                        question=question,
+                        is_answered=False,
+                        is_skipped=False
+                    )
+                
+                ExamActivityLog.objects.create(
                     attempt=attempt,
-                    question=question,
-                    is_answered=False,
-                    is_skipped=False
+                    activity_type='start',
+                    details={
+                        'ip': request.META.get('REMOTE_ADDR', 'unknown'),
+                        'user_agent': request.META.get('HTTP_USER_AGENT', 'unknown'),
+                        'attempt_number': attempt_number,
+                        'request_id': request_id
+                    }
                 )
+            
+            logger.info(
+                f'User {request.user.id} started exam {exam.id}, '
+                f'attempt {attempt_number}'
+            )
+            
+            return Response(
+                ExamAttemptSerializer(attempt).data,
+                status=status.HTTP_201_CREATED
+            )
         
-        return Response(
-            ExamAttemptSerializer(attempt).data,
-            status=status.HTTP_201_CREATED
-        )
+        except Exception as e:
+            logger.error(
+                f'Error starting exam {exam.id} for user {request.user.id}: {str(e)}',
+                exc_info=True
+            )
+            return Response(
+                {'error': '开始考试时发生错误，请稍后重试'},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
 
     @action(detail=True, methods=['get'], permission_classes=[IsTeacher | IsAdminUser])
     def attempts(self, request, pk=None):
@@ -459,33 +500,235 @@ class ExamAttemptViewSet(viewsets.ReadOnlyModelViewSet):
         return Response(ExamAttemptSerializer(attempts, many=True).data)
 
     @action(detail=True, methods=['post'], permission_classes=[IsStudent])
-    def submit(self, request, pk=None):
+    def submit_answer(self, request, pk=None):
+        """提交单题答案"""
         attempt = self.get_object()
         
-        if attempt.status != 'in_progress':
-            return Response(
-                {'error': '考试不在进行中'},
-                status=status.HTTP_400_BAD_REQUEST
+        serializer = ExamAnswerSubmitSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        
+        try:
+            if attempt.status != 'in_progress':
+                return Response(
+                    {'error': '考试不在进行中'},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+            
+            question_id = serializer.validated_data['question_id']
+            
+            with transaction.atomic():
+                try:
+                    answer = ExamAnswer.objects.select_for_update().get(
+                        attempt=attempt,
+                        question_id=question_id
+                    )
+                except ExamAnswer.DoesNotExist:
+                    return Response(
+                        {'error': '题目不存在'},
+                        status=status.HTTP_404_NOT_FOUND
+                    )
+                
+                answer.answer_text = serializer.validated_data.get('answer_text')
+                answer.answer_choice = serializer.validated_data.get('answer_choice', [])
+                answer.is_skipped = serializer.validated_data.get('is_skipped', False)
+                answer.is_flagged = serializer.validated_data.get('is_flagged', False)
+                
+                time_spent = serializer.validated_data.get('time_spent')
+                if time_spent is not None:
+                    answer.time_spent = time_spent
+                
+                if answer.answer_text or answer.answer_choice:
+                    answer.is_answered = True
+                else:
+                    answer.is_answered = False
+                
+                answer.save()
+                
+                ExamActivityLog.objects.create(
+                    attempt=attempt,
+                    activity_type='answer',
+                    details={
+                        'question_id': question_id,
+                        'is_answered': answer.is_answered,
+                        'is_skipped': answer.is_skipped,
+                        'is_flagged': answer.is_flagged,
+                        'time_spent': time_spent
+                    }
+                )
+            
+            logger.info(
+                f'User {request.user.id} submitted answer for question {question_id} '
+                f'in exam attempt {attempt.id}'
             )
+            
+            return Response({
+                'status': 'success',
+                'question_id': question_id,
+                'is_answered': answer.is_answered
+            })
         
-        now = timezone.now()
+        except Exception as e:
+            logger.error(
+                f'Error submitting answer for attempt {attempt.id}: {str(e)}',
+                exc_info=True
+            )
+            return Response(
+                {'error': '提交答案时发生错误'},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
+    
+    @action(detail=True, methods=['post'], permission_classes=[IsStudent])
+    def submit_answers_batch(self, request, pk=None):
+        """批量提交答案"""
+        attempt = self.get_object()
         
-        attempt.status = 'submitted'
-        attempt.submitted_manually = True
-        attempt.submit_time = now
-        attempt.end_time = now
+        serializer = ExamAnswerBatchSubmitSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
         
-        if attempt.start_time:
-            attempt.time_spent = int((attempt.end_time - attempt.start_time).total_seconds())
+        try:
+            if attempt.status != 'in_progress':
+                return Response(
+                    {'error': '考试不在进行中'},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+            
+            answers_data = serializer.validated_data['answers']
+            request_id = serializer.validated_data.get('request_id')
+            
+            if not answers_data:
+                return Response(
+                    {'error': '没有答案数据'},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+            
+            question_ids = [a['question_id'] for a in answers_data]
+            if len(question_ids) != len(set(question_ids)):
+                return Response(
+                    {'error': '存在重复的题目ID'},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+            
+            updated_count = 0
+            
+            with transaction.atomic():
+                for ans_data in answers_data:
+                    question_id = ans_data['question_id']
+                    
+                    try:
+                        answer = ExamAnswer.objects.select_for_update().get(
+                            attempt=attempt,
+                            question_id=question_id
+                        )
+                    except ExamAnswer.DoesNotExist:
+                        continue
+                    
+                    answer.answer_text = ans_data.get('answer_text')
+                    answer.answer_choice = ans_data.get('answer_choice', [])
+                    answer.is_skipped = ans_data.get('is_skipped', False)
+                    answer.is_flagged = ans_data.get('is_flagged', False)
+                    
+                    time_spent = ans_data.get('time_spent')
+                    if time_spent is not None:
+                        answer.time_spent = time_spent
+                    
+                    if answer.answer_text or answer.answer_choice:
+                        answer.is_answered = True
+                    else:
+                        answer.is_answered = False
+                    
+                    answer.save()
+                    updated_count += 1
+                
+                ExamActivityLog.objects.create(
+                    attempt=attempt,
+                    activity_type='answer',
+                    details={
+                        'batch_size': len(answers_data),
+                        'updated_count': updated_count,
+                        'request_id': request_id
+                    }
+                )
+            
+            logger.info(
+                f'User {request.user.id} batch submitted {updated_count} answers '
+                f'for attempt {attempt.id}'
+            )
+            
+            return Response({
+                'status': 'success',
+                'updated_count': updated_count
+            })
         
-        attempt.save()
+        except Exception as e:
+            logger.error(
+                f'Error batch submitting answers for attempt {attempt.id}: {str(e)}',
+                exc_info=True
+            )
+            return Response(
+                {'error': '批量提交答案时发生错误'},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
+
+    @action(detail=True, methods=['post'], permission_classes=[IsStudent])
+    def submit(self, request, pk=None):
+        """提交考试"""
+        attempt = self.get_object()
         
-        if attempt.exam.exam_questions.filter(question_type__in=[
-            'single_choice', 'multi_choice', 'true_false', 'fill_blank'
-        ]):
-            self._auto_grade(attempt)
+        try:
+            if attempt.status != 'in_progress':
+                if attempt.status in ['submitted', 'graded']:
+                    return Response(ExamAttemptSerializer(attempt).data)
+                return Response(
+                    {'error': '考试不在进行中'},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+            
+            now = timezone.now()
+            
+            with transaction.atomic():
+                attempt = ExamAttempt.objects.select_for_update().get(id=attempt.id)
+                
+                if attempt.status != 'in_progress':
+                    return Response(ExamAttemptSerializer(attempt).data)
+                
+                attempt.status = 'submitted'
+                attempt.submitted_manually = True
+                attempt.submit_time = now
+                attempt.end_time = now
+                
+                if attempt.start_time:
+                    attempt.time_spent = int((attempt.end_time - attempt.start_time).total_seconds())
+                
+                attempt.save()
+                
+                ExamActivityLog.objects.create(
+                    attempt=attempt,
+                    activity_type='submit',
+                    details={
+                        'time_spent': attempt.time_spent,
+                        'submitted_manually': True,
+                        'timestamp': now.isoformat()
+                    }
+                )
+                
+                self._auto_grade(attempt)
+            
+            logger.info(
+                f'User {request.user.id} submitted exam attempt {attempt.id}, '
+                f'score: {attempt.total_score}'
+            )
+            
+            return Response(ExamAttemptSerializer(attempt).data)
         
-        return Response(ExamAttemptSerializer(attempt).data)
+        except Exception as e:
+            logger.error(
+                f'Error submitting exam attempt {attempt.id}: {str(e)}',
+                exc_info=True
+            )
+            return Response(
+                {'error': '提交考试时发生错误'},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
 
     def _auto_grade(self, attempt):
         answers = attempt.answers.select_related('question').all()
@@ -548,52 +791,241 @@ class ExamAttemptViewSet(viewsets.ReadOnlyModelViewSet):
         
         attempt.save()
 
-    @action(detail=True, methods=['get'], permission_classes=[IsTeacher | IsAdminUser])
+    @action(detail=True, methods=['post'], permission_classes=[IsTeacher | IsAdminUser])
     def grade(self, request, pk=None):
+        """批改考试"""
         attempt = self.get_object()
         
-        if attempt.status != 'submitted':
-            return Response(
-                {'error': '考试未提交'},
-                status=status.HTTP_400_BAD_REQUEST
-            )
-        
-        question_scores = request.data.get('question_scores', {})
-        total_score = request.data.get('total_score')
-        feedback = request.data.get('feedback')
-        
-        for question_id, score in question_scores.items():
-            try:
-                answer = ExamAnswer.objects.get(
-                    attempt=attempt,
-                    question_id=question_id
+        try:
+            if attempt.status != 'submitted':
+                if attempt.status == 'graded':
+                    return Response(ExamAttemptSerializer(attempt).data)
+                return Response(
+                    {'error': '考试未提交，无法批改'},
+                    status=status.HTTP_400_BAD_REQUEST
                 )
-                answer.score = score
-                answer.teacher_feedback = request.data.get(f'feedback_{question_id}')
-                answer.is_correct = score == answer.question.score
-                answer.save()
-            except ExamAnswer.DoesNotExist:
-                continue
+            
+            question_scores = request.data.get('question_scores', {})
+            total_score = request.data.get('total_score')
+            feedback = request.data.get('feedback')
+            
+            if total_score is not None:
+                if total_score < 0 or total_score > attempt.exam.total_score:
+                    return Response(
+                        {'error': f'总分应在0到{attempt.exam.total_score}之间'},
+                        status=status.HTTP_400_BAD_REQUEST
+                    )
+            
+            with transaction.atomic():
+                for question_id, score in question_scores.items():
+                    if score < 0:
+                        return Response(
+                            {'error': f'题目分数不能为负数'},
+                            status=status.HTTP_400_BAD_REQUEST
+                        )
+                    
+                    try:
+                        answer = ExamAnswer.objects.get(
+                            attempt=attempt,
+                            question_id=question_id
+                        )
+                        
+                        max_score = answer.question.score
+                        if score > max_score:
+                            return Response(
+                                {'error': f'题目{question_id}分数不能超过{max_score}'},
+                                status=status.HTTP_400_BAD_REQUEST
+                            )
+                        
+                        answer.score = score
+                        answer.teacher_feedback = request.data.get(f'feedback_{question_id}')
+                        answer.is_correct = score == max_score
+                        answer.graded_by = request.user
+                        answer.graded_at = timezone.now()
+                        answer.save()
+                    except ExamAnswer.DoesNotExist:
+                        continue
+                
+                if total_score is None:
+                    answer_scores = attempt.answers.values_list('score', flat=True)
+                    total_score = sum(s for s in answer_scores if s is not None)
+                
+                attempt.total_score = total_score
+                attempt.score_percentage = (
+                    total_score / attempt.exam.total_score 
+                    if attempt.exam.total_score > 0 else 0
+                )
+                attempt.is_passed = total_score >= attempt.exam.pass_score
+                attempt.feedback = feedback
+                attempt.graded_by = request.user
+                attempt.graded_at = timezone.now()
+                attempt.status = 'graded'
+                
+                attempt.correct_count = attempt.answers.filter(is_correct=True).count()
+                attempt.incorrect_count = attempt.answers.filter(
+                    is_answered=True, is_correct=False
+                ).count()
+                attempt.unanswered_count = attempt.answers.filter(is_answered=False).count()
+                
+                attempt.save()
+            
+            logger.info(
+                f'Teacher {request.user.id} graded exam attempt {attempt.id}, '
+                f'score: {total_score}'
+            )
+            
+            return Response(ExamAttemptSerializer(attempt).data)
         
-        if total_score is None:
-            answer_scores = attempt.answers.values_list('score', flat=True)
-            total_score = sum(s for s in answer_scores if s is not None)
+        except Exception as e:
+            logger.error(
+                f'Error grading exam attempt {attempt.id}: {str(e)}',
+                exc_info=True
+            )
+            return Response(
+                {'error': '批改考试时发生错误'},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
+    
+    @action(detail=False, methods=['post'], permission_classes=[IsTeacher | IsAdminUser])
+    def batch_grade(self, request):
+        """批量批改考试"""
+        serializer = ExamBatchGradeSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
         
-        attempt.total_score = total_score
-        attempt.score_percentage = total_score / attempt.exam.total_score if attempt.exam.total_score > 0 else 0
-        attempt.is_passed = total_score >= attempt.exam.pass_score
-        attempt.feedback = feedback
-        attempt.graded_by = request.user
-        attempt.graded_at = timezone.now()
-        attempt.status = 'graded'
+        try:
+            grades_data = serializer.validated_data['grades']
+            request_id = serializer.validated_data.get('request_id')
+            
+            if not grades_data:
+                return Response(
+                    {'error': '没有批改数据'},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+            
+            attempt_ids = [g['attempt_id'] for g in grades_data]
+            if len(attempt_ids) != len(set(attempt_ids)):
+                return Response(
+                    {'error': '存在重复的考试记录ID'},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+            
+            results = []
+            errors = []
+            
+            with transaction.atomic():
+                for grade_data in grades_data:
+                    attempt_id = grade_data['attempt_id']
+                    total_score = grade_data['total_score']
+                    feedback = grade_data.get('feedback')
+                    question_scores = grade_data.get('question_scores', {})
+                    
+                    try:
+                        attempt = ExamAttempt.objects.select_for_update().get(id=attempt_id)
+                        
+                        if attempt.status != 'submitted':
+                            errors.append({
+                                'attempt_id': attempt_id,
+                                'error': '考试未提交'
+                            })
+                            continue
+                        
+                        if total_score < 0 or total_score > attempt.exam.total_score:
+                            errors.append({
+                                'attempt_id': attempt_id,
+                                'error': f'总分应在0到{attempt.exam.total_score}之间'
+                            })
+                            continue
+                        
+                        for question_id, score in question_scores.items():
+                            if score < 0:
+                                errors.append({
+                                    'attempt_id': attempt_id,
+                                    'error': '题目分数不能为负数'
+                                })
+                                raise Exception('无效分数')
+                            
+                            try:
+                                answer = ExamAnswer.objects.get(
+                                    attempt=attempt,
+                                    question_id=question_id
+                                )
+                                
+                                max_score = answer.question.score
+                                if score > max_score:
+                                    errors.append({
+                                        'attempt_id': attempt_id,
+                                        'error': f'题目{question_id}分数不能超过{max_score}'
+                                    })
+                                    raise Exception('无效分数')
+                                
+                                answer.score = score
+                                answer.is_correct = score == max_score
+                                answer.graded_by = request.user
+                                answer.graded_at = timezone.now()
+                                answer.save()
+                            except ExamAnswer.DoesNotExist:
+                                continue
+                        
+                        attempt.total_score = total_score
+                        attempt.score_percentage = (
+                            total_score / attempt.exam.total_score 
+                            if attempt.exam.total_score > 0 else 0
+                        )
+                        attempt.is_passed = total_score >= attempt.exam.pass_score
+                        attempt.feedback = feedback
+                        attempt.graded_by = request.user
+                        attempt.graded_at = timezone.now()
+                        attempt.status = 'graded'
+                        
+                        attempt.correct_count = attempt.answers.filter(is_correct=True).count()
+                        attempt.incorrect_count = attempt.answers.filter(
+                            is_answered=True, is_correct=False
+                        ).count()
+                        attempt.unanswered_count = attempt.answers.filter(
+                            is_answered=False
+                        ).count()
+                        
+                        attempt.save()
+                        
+                        results.append({
+                            'attempt_id': attempt_id,
+                            'status': 'success',
+                            'total_score': float(total_score)
+                        })
+                        
+                    except ExamAttempt.DoesNotExist:
+                        errors.append({
+                            'attempt_id': attempt_id,
+                            'error': '考试记录不存在'
+                        })
+                    except Exception as e:
+                        if not errors or errors[-1].get('attempt_id') != attempt_id:
+                            errors.append({
+                                'attempt_id': attempt_id,
+                                'error': str(e)
+                            })
+            
+            logger.info(
+                f'Teacher {request.user.id} batch graded {len(results)} exams, '
+                f'{len(errors)} errors'
+            )
+            
+            return Response({
+                'success_count': len(results),
+                'error_count': len(errors),
+                'results': results,
+                'errors': errors
+            })
         
-        attempt.correct_count = attempt.answers.filter(is_correct=True).count()
-        attempt.incorrect_count = attempt.answers.filter(is_correct=False).count()
-        attempt.unanswered_count = attempt.answers.filter(is_answered=False).count()
-        
-        attempt.save()
-        
-        return Response(ExamAttemptSerializer(attempt).data)
+        except Exception as e:
+            logger.error(
+                f'Error batch grading exams: {str(e)}',
+                exc_info=True
+            )
+            return Response(
+                {'error': '批量批改时发生错误'},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
 
     @action(detail=True, methods=['get'])
     def answers(self, request, pk=None):
@@ -661,3 +1093,330 @@ class ExamAttemptViewSet(viewsets.ReadOnlyModelViewSet):
             attempt.save()
         
         return Response(CheatingRecordSerializer(record).data)
+
+
+class AntiCheatingBeaconView(generics.GenericAPIView):
+    permission_classes = [permissions.AllowAny]
+    
+    def post(self, request, *args, **kwargs):
+        logger = logging.getLogger(__name__)
+        
+        try:
+            data = request.data
+            
+            if isinstance(data, bytes):
+                import json
+                data = json.loads(data.decode('utf-8'))
+            
+            if request.body and isinstance(data, dict) and 'type' not in data:
+                try:
+                    import json
+                    data = json.loads(request.body.decode('utf-8'))
+                except:
+                    pass
+            
+            attempt_id = data.get('attempt_id')
+            exam_id = data.get('exam_id')
+            event_type = data.get('type')
+            event_data = data.get('data', {})
+            
+            logger.info(f"Beacon received: type={event_type}, attempt_id={attempt_id}")
+            
+            if not attempt_id:
+                return Response({'status': 'ignored', 'reason': 'no_attempt_id'}, status=status.HTTP_200_OK)
+            
+            try:
+                attempt = ExamAttempt.objects.select_related('exam').get(id=attempt_id)
+            except ExamAttempt.DoesNotExist:
+                logger.warning(f"Beacon: attempt {attempt_id} not found")
+                return Response({'status': 'not_found'}, status=status.HTTP_200_OK)
+            
+            if attempt.status not in ['in_progress', 'paused']:
+                logger.info(f"Beacon: attempt {attempt_id} is not in progress, status: {attempt.status}")
+                return Response({'status': 'already_submitted', 'current_status': attempt.status}, status=status.HTTP_200_OK)
+            
+            self._handle_beacon_event(attempt, event_type, event_data, request)
+            
+            return Response({'status': 'received', 'event_type': event_type}, status=status.HTTP_200_OK)
+            
+        except Exception as e:
+            logger.error(f'Beacon processing error: {str(e)}', exc_info=True)
+            return Response({'status': 'error', 'message': str(e)}, status=status.HTTP_200_OK)
+    
+    def _handle_beacon_event(self, attempt, event_type, event_data, request):
+        from django.utils import timezone
+        from django.db import transaction
+        
+        logger = logging.getLogger(__name__)
+        
+        now = timezone.now()
+        
+        ip_address = request.META.get('REMOTE_ADDR', 'unknown')
+        user_agent = request.META.get('HTTP_USER_AGENT', 'unknown')
+        
+        common_details = {
+            'timestamp': event_data.get('timestamp', now.isoformat()),
+            'ip': ip_address,
+            'user_agent': user_agent
+        }
+        
+        if event_type == 'before_unload':
+            logger.info(f"Beacon: before_unload for attempt {attempt.id}")
+            
+            ExamActivityLog.objects.create(
+                attempt=attempt,
+                activity_type='page_unload',
+                details=common_details
+            )
+            
+            violation_state = event_data.get('violation_state', {})
+            if violation_state:
+                self._process_violation_state(attempt, violation_state)
+        
+        elif event_type == 'page_hide':
+            logger.info(f"Beacon: page_hide for attempt {attempt.id}")
+            
+            violation_state = event_data.get('violation_state', {})
+            
+            details = {
+                **common_details,
+                'violation_state': violation_state,
+                'last_activity': event_data.get('last_activity'),
+                'tab_switch_count': event_data.get('tab_switch_count')
+            }
+            
+            ExamActivityLog.objects.create(
+                attempt=attempt,
+                activity_type='page_hide',
+                details=details
+            )
+            
+            if violation_state:
+                self._process_violation_state(attempt, violation_state)
+            
+            self._record_tab_leave_if_needed(attempt, event_data)
+        
+        elif event_type == 'beacon_event':
+            logger.info(f"Beacon: beacon_event for attempt {attempt.id}")
+            
+            sub_event_type = event_data.get('event_type', 'unknown')
+            details = {
+                **common_details,
+                'sub_event_type': sub_event_type,
+                'data': event_data
+            }
+            
+            ExamActivityLog.objects.create(
+                attempt=attempt,
+                activity_type=f'beacon_{sub_event_type}',
+                details=details
+            )
+            
+            self._handle_specific_beacon_event(attempt, sub_event_type, event_data, request)
+        
+        else:
+            logger.info(f"Beacon: unknown event type '{event_type}' for attempt {attempt.id}")
+            
+            ExamActivityLog.objects.create(
+                attempt=attempt,
+                activity_type=f'beacon_{event_type}',
+                details={
+                    **common_details,
+                    'event_type': event_type,
+                    'data': event_data
+                }
+            )
+    
+    def _process_violation_state(self, attempt, violation_state):
+        logger = logging.getLogger(__name__)
+        logger.info(f"Processing violation state for attempt {attempt.id}: {violation_state}")
+        
+        tab_switch_count = violation_state.get('tabSwitchCount', 0)
+        total_violations = violation_state.get('totalViolations', 0)
+        dev_tools_open_attempts = violation_state.get('devToolsOpenAttempts', 0)
+        refresh_attempts = violation_state.get('refreshAttempts', 0)
+        copy_attempts = violation_state.get('copyAttempts', 0)
+        paste_attempts = violation_state.get('pasteAttempts', 0)
+        
+        max_tab_switches = getattr(attempt.exam, 'max_tab_switches', 3) or 3
+        max_violations = 10
+        max_dev_tools = 2
+        max_refresh = 2
+        
+        should_force_submit = False
+        reason = ''
+        
+        if tab_switch_count >= max_tab_switches:
+            should_force_submit = True
+            reason = f'切出页面次数超过限制({max_tab_switches}次)'
+        
+        elif dev_tools_open_attempts >= max_dev_tools:
+            should_force_submit = True
+            reason = f'开发者工具打开超过限制({max_dev_tools}次)'
+        
+        elif refresh_attempts >= max_refresh:
+            should_force_submit = True
+            reason = f'刷新页面超过限制({max_refresh}次)'
+        
+        elif total_violations >= max_violations:
+            should_force_submit = True
+            reason = f'违规次数超过限制({max_violations}次)'
+        
+        if should_force_submit and attempt.status == 'in_progress':
+            logger.warning(f"Force submitting attempt {attempt.id} from Beacon: {reason}")
+            self._force_submit_attempt(attempt, reason)
+        
+        elif tab_switch_count > 0 or copy_attempts > 0 or paste_attempts > 0:
+            logger.info(f"Recording violations for attempt {attempt.id}: tab={tab_switch_count}, copy={copy_attempts}, paste={paste_attempts}")
+            
+            if tab_switch_count > 0:
+                self._record_cheating(
+                    attempt,
+                    'tab_switch_from_beacon',
+                    f'Beacon检测到切出页面，次数: {tab_switch_count}',
+                    'medium',
+                    {'count': tab_switch_count, 'source': 'beacon'}
+                )
+            
+            if copy_attempts > 0:
+                self._record_cheating(
+                    attempt,
+                    'copy_attempt_from_beacon',
+                    f'Beacon检测到复制尝试，次数: {copy_attempts}',
+                    'low',
+                    {'count': copy_attempts}
+                )
+            
+            if paste_attempts > 0:
+                self._record_cheating(
+                    attempt,
+                    'paste_attempt_from_beacon',
+                    f'Beacon检测到粘贴尝试，次数: {paste_attempts}',
+                    'low',
+                    {'count': paste_attempts}
+                )
+    
+    def _handle_specific_beacon_event(self, attempt, event_type, event_data, request):
+        if event_type in ['tab_leave', 'tab_switch']:
+            count = event_data.get('count', 1)
+            self._record_cheating(
+                attempt,
+                'tab_switch',
+                f'切出页面，次数: {count}',
+                'medium',
+                {'count': count, 'source': 'beacon'}
+            )
+        
+        elif event_type in ['dev_tools_open', 'console_open']:
+            detection_method = event_data.get('detection_method', 'beacon')
+            count = event_data.get('count', 1)
+            self._record_cheating(
+                attempt,
+                event_type,
+                f'检测到开发者工具/控制台打开（{detection_method}）',
+                'high',
+                {'detection_method': detection_method, 'count': count}
+            )
+        
+        elif event_type in ['refresh_attempt', 'refresh_detected']:
+            self._record_cheating(
+                attempt,
+                event_type,
+                '检测到页面刷新尝试',
+                'medium',
+                {'source': 'beacon'}
+            )
+        
+        elif event_type in ['copy_attempt', 'paste_attempt', 'cut_attempt']:
+            self._record_cheating(
+                attempt,
+                event_type,
+                f'检测到{event_type.replace("_", " ")}',
+                'low',
+                {'source': 'beacon'}
+            )
+    
+    def _record_tab_leave_if_needed(self, attempt, event_data):
+        tab_switch_count = event_data.get('tab_switch_count', 0)
+        if tab_switch_count > 0:
+            from django.utils import timezone
+            
+            existing_count = CheatingRecord.objects.filter(
+                attempt=attempt,
+                cheating_type='tab_switch'
+            ).count()
+            
+            if tab_switch_count > existing_count:
+                self._record_cheating(
+                    attempt,
+                    'tab_switch',
+                    f'页面隐藏时检测到切出页面，次数: {tab_switch_count}',
+                    'medium',
+                    {'count': tab_switch_count, 'source': 'page_hide'}
+                )
+    
+    def _record_cheating(self, attempt, cheating_type, description, severity, evidence):
+        try:
+            CheatingRecord.objects.create(
+                attempt=attempt,
+                cheating_type=cheating_type,
+                description=description,
+                severity=severity,
+                evidence=evidence or {}
+            )
+            
+            if severity in ['high', 'critical']:
+                attempt.is_cheating_detected = True
+                if not attempt.cheating_reason:
+                    attempt.cheating_reason = description
+                else:
+                    attempt.cheating_reason = f"{attempt.cheating_reason}; {description}"
+                attempt.save(update_fields=['is_cheating_detected', 'cheating_reason'])
+        
+        except Exception as e:
+            logger = logging.getLogger(__name__)
+            logger.error(f"Failed to record cheating from beacon: {str(e)}")
+    
+    def _force_submit_attempt(self, attempt, reason):
+        from django.utils import timezone
+        from django.db import transaction
+        
+        logger = logging.getLogger(__name__)
+        
+        try:
+            with transaction.atomic():
+                attempt.refresh_from_db()
+                
+                if attempt.status not in ['in_progress', 'paused']:
+                    logger.info(f"Attempt {attempt.id} is not in progress, skipping force submit")
+                    return
+                
+                now = timezone.now()
+                
+                attempt.status = 'submitted'
+                attempt.submitted_manually = False
+                attempt.auto_submit_reason = 'cheating'
+                attempt.is_cheating_detected = True
+                attempt.cheating_reason = reason
+                attempt.submit_time = now
+                attempt.end_time = now
+                
+                if attempt.start_time:
+                    attempt.time_spent = int(
+                        (attempt.end_time - attempt.start_time).total_seconds()
+                    )
+                
+                attempt.save()
+                
+                CheatingRecord.objects.create(
+                    attempt=attempt,
+                    cheating_type='auto_submit',
+                    description=reason,
+                    severity='high',
+                    action_taken='forced_submit'
+                )
+                
+                logger.info(f"Attempt {attempt.id} force submitted from Beacon: {reason}")
+        
+        except Exception as e:
+            logger.error(f"Failed to force submit attempt from beacon: {str(e)}", exc_info=True)

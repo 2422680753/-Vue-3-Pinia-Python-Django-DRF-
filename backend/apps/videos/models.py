@@ -1,7 +1,9 @@
+import hashlib
 from django.db import models
 from django.utils.translation import gettext_lazy as _
 from django.conf import settings
 from django.conf import settings as django_settings
+from django.utils import timezone
 
 
 class VideoProgress(models.Model):
@@ -30,6 +32,11 @@ class VideoProgress(models.Model):
     
     last_watched_at = models.DateTimeField(auto_now=True, verbose_name='最后观看时间')
     created_at = models.DateTimeField(auto_now_add=True, verbose_name='创建时间')
+    
+    version = models.PositiveIntegerField(default=1, verbose_name='版本号')
+    last_update_time = models.DateTimeField(auto_now=True, verbose_name='最后更新时间')
+    last_update_client = models.CharField(max_length=50, null=True, blank=True, verbose_name='最后更新客户端')
+    last_update_ip = models.GenericIPAddressField(null=True, blank=True, verbose_name='最后更新IP')
 
     class Meta:
         verbose_name = '视频进度'
@@ -56,6 +63,36 @@ class VideoProgress(models.Model):
     @property
     def course(self):
         return self.lesson.chapter.course
+    
+    def can_update(self, new_time, new_progress, client_time=None):
+        if self.is_completed:
+            return False
+        
+        if new_time < 0:
+            return False
+        
+        if new_time > self.total_duration + 60:
+            return False
+        
+        if new_progress < 0 or new_progress > 1.1:
+            return False
+        
+        if new_time < self.current_time - 300:
+            threshold = getattr(django_settings, 'VIDEO_ALLOWED_BACKWARD_SECONDS', 300)
+            if self.current_time - new_time > threshold:
+                return False
+        
+        return True
+    
+    def get_progress_state(self):
+        return {
+            'current_time': self.current_time,
+            'total_duration': self.total_duration,
+            'progress': self.progress,
+            'is_completed': self.is_completed,
+            'version': self.version,
+            'last_update_time': self.last_update_time.isoformat() if self.last_update_time else None
+        }
 
 
 class VideoProgressHistory(models.Model):
@@ -76,8 +113,10 @@ class VideoProgressHistory(models.Model):
     seek_to = models.FloatField(null=True, blank=True, verbose_name='快进后时间')
     
     session_id = models.CharField(max_length=100, null=True, blank=True, verbose_name='会话ID')
+    request_id = models.CharField(max_length=64, null=True, blank=True, verbose_name='请求ID', unique=True)
     ip_address = models.GenericIPAddressField(null=True, blank=True, verbose_name='IP地址')
     device_info = models.TextField(max_length=500, null=True, blank=True, verbose_name='设备信息')
+    user_agent = models.TextField(null=True, blank=True, verbose_name='User-Agent')
     
     created_at = models.DateTimeField(auto_now_add=True, verbose_name='记录时间')
 
@@ -87,10 +126,118 @@ class VideoProgressHistory(models.Model):
         ordering = ['-created_at']
         indexes = [
             models.Index(fields=['video_progress', '-created_at']),
+            models.Index(fields=['request_id']),
         ]
 
     def __str__(self):
         return f'{self.video_progress.student.username} - {self.created_at}'
+    
+    @staticmethod
+    def generate_request_id(*args):
+        combined = '_'.join(str(arg) for arg in args)
+        return hashlib.md5(combined.encode()).hexdigest()
+
+
+class VideoProgressConflict(models.Model):
+    CONFLICT_TYPES = [
+        ('time_backward', '时间回退'),
+        ('version_mismatch', '版本不匹配'),
+        ('multi_device', '多设备冲突'),
+        ('data_inconsistent', '数据不一致'),
+    ]
+    
+    video_progress = models.ForeignKey(
+        VideoProgress,
+        on_delete=models.CASCADE,
+        related_name='conflict_records',
+        verbose_name='视频进度'
+    )
+    
+    conflict_type = models.CharField(
+        max_length=30,
+        choices=CONFLICT_TYPES,
+        verbose_name='冲突类型'
+    )
+    
+    server_state = models.JSONField(verbose_name='服务器状态')
+    client_state = models.JSONField(verbose_name='客户端状态')
+    
+    resolution = models.JSONField(null=True, blank=True, verbose_name='解决方案')
+    is_resolved = models.BooleanField(default=False, verbose_name='是否已解决')
+    
+    session_id = models.CharField(max_length=100, null=True, blank=True, verbose_name='会话ID')
+    ip_address = models.GenericIPAddressField(null=True, blank=True, verbose_name='IP地址')
+    device_info = models.TextField(max_length=500, null=True, blank=True, verbose_name='设备信息')
+    
+    created_at = models.DateTimeField(auto_now_add=True, verbose_name='创建时间')
+    resolved_at = models.DateTimeField(null=True, blank=True, verbose_name='解决时间')
+
+    class Meta:
+        verbose_name = '视频进度冲突'
+        verbose_name_plural = '视频进度冲突'
+        ordering = ['-created_at']
+
+    def __str__(self):
+        return f'{self.video_progress} - {self.get_conflict_type_display()}'
+
+
+class VideoWatchSession(models.Model):
+    video_progress = models.ForeignKey(
+        VideoProgress,
+        on_delete=models.CASCADE,
+        related_name='watch_sessions',
+        verbose_name='视频进度'
+    )
+    
+    session_id = models.CharField(max_length=100, unique=True, verbose_name='会话ID')
+    start_time = models.DateTimeField(auto_now_add=True, verbose_name='开始时间')
+    end_time = models.DateTimeField(null=True, blank=True, verbose_name='结束时间')
+    
+    initial_time = models.FloatField(default=0, verbose_name='初始播放位置')
+    final_time = models.FloatField(null=True, blank=True, verbose_name='最终播放位置')
+    total_seconds = models.FloatField(default=0, verbose_name='本次观看秒数')
+    effective_seconds = models.FloatField(default=0, verbose_name='有效观看秒数')
+    
+    is_active = models.BooleanField(default=True, verbose_name='是否活跃')
+    last_heartbeat = models.DateTimeField(auto_now_add=True, verbose_name='最后心跳时间')
+    
+    ip_address = models.GenericIPAddressField(null=True, blank=True, verbose_name='IP地址')
+    device_info = models.TextField(max_length=500, null=True, blank=True, verbose_name='设备信息')
+    user_agent = models.TextField(null=True, blank=True, verbose_name='User-Agent')
+    
+    created_at = models.DateTimeField(auto_now_add=True, verbose_name='创建时间')
+
+    class Meta:
+        verbose_name = '观看会话'
+        verbose_name_plural = '观看会话'
+        ordering = ['-created_at']
+        indexes = [
+            models.Index(fields=['video_progress', '-created_at']),
+            models.Index(fields=['session_id']),
+            models.Index(fields=['is_active', 'last_heartbeat']),
+        ]
+
+    def __str__(self):
+        return f'{self.video_progress} - {self.session_id}'
+    
+    def end_session(self, final_time=None):
+        self.is_active = False
+        self.end_time = timezone.now()
+        if final_time is not None:
+            self.final_time = final_time
+        self.save()
+        
+        VideoWatchSession.objects.filter(
+            video_progress=self.video_progress,
+            is_active=True
+        ).exclude(id=self.id).update(
+            is_active=False,
+            end_time=timezone.now()
+        )
+    
+    def update_heartbeat(self):
+        self.last_heartbeat = timezone.now()
+        self.save(update_fields=['last_heartbeat'])
 
 
 class VideoQuality(models.TextChoices):

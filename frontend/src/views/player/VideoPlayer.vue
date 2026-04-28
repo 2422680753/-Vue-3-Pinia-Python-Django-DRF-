@@ -12,6 +12,13 @@
             />
           </div>
           
+          <div class="sync-status" v-if="syncStatus !== 'idle'">
+            <el-icon v-if="syncStatus === 'syncing'" class="syncing"><Loading /></el-icon>
+            <el-icon v-else-if="syncStatus === 'synced'" class="synced"><CircleCheck /></el-icon>
+            <el-icon v-else-if="syncStatus === 'error'" class="error"><Warning /></el-icon>
+            <span>{{ syncStatusText }}</span>
+          </div>
+          
           <div class="video-info">
             <h2>{{ lessonInfo?.title }}</h2>
             <div class="video-meta">
@@ -167,16 +174,42 @@
         <el-button type="primary" @click="saveNote">保存</el-button>
       </template>
     </el-dialog>
+    
+    <el-dialog
+      v-model="showConflictDialog"
+      title="进度冲突"
+      width="400px"
+    >
+      <div class="conflict-info">
+        <el-icon :size="48" color="#E6A23C"><Warning /></el-icon>
+        <p>检测到其他设备的播放进度较新，是否同步？</p>
+        <div class="conflict-details">
+          <div class="conflict-item">
+            <span>当前设备进度：</span>
+            <span class="local">{{ formatDuration(localProgressTime) }}</span>
+          </div>
+          <div class="conflict-item">
+            <span>服务器最新进度：</span>
+            <span class="server">{{ formatDuration(serverProgressTime) }}</span>
+          </div>
+        </div>
+      </div>
+      <template #footer>
+        <el-button @click="useLocalProgress">使用当前进度</el-button>
+        <el-button type="primary" @click="useServerProgress">同步服务器进度</el-button>
+      </template>
+    </el-dialog>
   </div>
 </template>
 
 <script setup lang="ts">
 import { ref, reactive, onMounted, onUnmounted, computed, nextTick, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
+import { ElMessage } from 'element-plus'
 import videojs from 'video.js'
 import 'video.js/dist/video-js.css'
-import { videoProgressSocket } from '@/utils/websocket'
-import { videoApi, Video, VideoProgress } from '@/api/videos'
+import { createVideoProgressSync, type ProgressState } from '@/utils/videoProgressSync'
+import { videoApi, Video } from '@/api/videos'
 import { courseApi, Chapter, Lesson } from '@/api/courses'
 import dayjs from 'dayjs'
 
@@ -190,6 +223,8 @@ const videoRef = ref<HTMLVideoElement>()
 const videoContainer = ref<HTMLDivElement>()
 let player: any = null
 
+let syncManager: ReturnType<typeof createVideoProgressSync> | null = null
+
 const courseInfo = ref<any>()
 const lessonInfo = ref<Lesson>()
 const videoInfo = ref<Video>()
@@ -197,6 +232,17 @@ const progress = ref(0)
 const currentTime = ref(0)
 const duration = ref(0)
 const isComplete = ref(false)
+const version = ref(1)
+
+const syncStatus = ref<'idle' | 'syncing' | 'synced' | 'error'>('idle')
+const syncStatusText = computed(() => {
+  switch (syncStatus.value) {
+    case 'syncing': return '同步中...'
+    case 'synced': return '已同步'
+    case 'error': return '同步失败'
+    default: return ''
+  }
+})
 
 const chapters = ref<Chapter[]>([])
 const lessons = ref<Lesson[]>([])
@@ -212,6 +258,10 @@ const noteForm = reactive({
   content: ''
 })
 
+const showConflictDialog = ref(false)
+const localProgressTime = ref(0)
+const serverProgressTime = ref(0)
+
 const currentTimeStr = computed(() => {
   const seconds = Math.floor(currentTime.value)
   const h = Math.floor(seconds / 3600)
@@ -221,13 +271,14 @@ const currentTimeStr = computed(() => {
 })
 
 const formatDuration = (seconds: number) => {
+  if (!seconds || seconds <= 0) return '00:00'
   const h = Math.floor(seconds / 3600)
   const m = Math.floor((seconds % 3600) / 60)
   const s = seconds % 60
   if (h > 0) {
     return `${h}:${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`
   }
-  return `${m}:${String(s).padStart(2, '0')}`
+  return `${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`
 }
 
 const formatProgress = (percentage: number) => {
@@ -239,6 +290,7 @@ const formatTime = (seconds: number) => {
 }
 
 const formatFileSize = (bytes: number) => {
+  if (!bytes) return '0 B'
   if (bytes < 1024) return bytes + ' B'
   if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KB'
   return (bytes / 1024 / 1024).toFixed(1) + ' MB'
@@ -261,8 +313,22 @@ const toggleChapter = (chapterId: number) => {
   }
 }
 
-const goToLesson = (id: number) => {
+const goToLesson = async (id: number) => {
+  if (id === lessonId.value) return
+  
+  if (syncManager) {
+    syncManager.setPlaying(false)
+  }
+  
   router.push(`/learn/${courseId.value}/lesson/${id}`)
+}
+
+const handleProgressUpdate = (state: ProgressState) => {
+  progress.value = state.progress
+  currentTime.value = state.currentTime
+  duration.value = state.totalDuration
+  isComplete.value = state.isCompleted
+  version.value = state.version
 }
 
 const initPlayer = async () => {
@@ -290,125 +356,133 @@ const initPlayer = async () => {
   player.on('timeupdate', handleTimeUpdate)
   player.on('ended', handleEnded)
   player.on('loadedmetadata', handleLoadedMetadata)
+  player.on('seeking', handleSeeking)
+  player.on('seeked', handleSeeked)
+  player.on('waiting', handleWaiting)
+  player.on('playing', handlePlaying)
   
-  if (progress.value > 0 && progress.value < 1) {
-    player.currentTime(progress.value * duration.value)
+  if (progress.value > 0 && progress.value < 1 && duration.value > 0) {
+    const targetTime = progress.value * duration.value
+    player.currentTime(targetTime)
+    currentTime.value = targetTime
   }
 }
 
 const handlePlay = () => {
-  sendProgressUpdate(true)
+  if (syncManager) {
+    syncManager.setPlaying(true)
+  }
   
-  videoProgressSocket.send({
-    type: 'activity',
-    data: {
-      event_type: 'play',
-      video_id: videoInfo.value?.id
-    }
-  })
+  syncStatus.value = 'syncing'
 }
 
 const handlePause = () => {
-  sendProgressUpdate(false)
+  if (syncManager) {
+    syncManager.setPlaying(false)
+  }
   
-  videoProgressSocket.send({
-    type: 'activity',
-    data: {
-      event_type: 'pause',
-      video_id: videoInfo.value?.id
-    }
-  })
+  syncStatus.value = 'synced'
 }
 
 const handleTimeUpdate = () => {
   if (!player) return
-  currentTime.value = player.currentTime()
-  duration.value = player.duration()
+  
+  const time = player.currentTime()
+  const dur = player.duration()
+  
+  if (!isNaN(dur) && dur > 0) {
+    duration.value = dur
+  }
+  
+  currentTime.value = time
   
   if (duration.value > 0) {
-    progress.value = currentTime.value / duration.value
+    progress.value = Math.min(time / duration.value, 1)
   }
+  
+  if (syncManager && !isNaN(dur)) {
+    syncManager.setProgress(time, dur)
+  }
+}
+
+const handleSeeking = () => {
+  if (syncManager && player) {
+    const current = player.currentTime()
+    syncManager.startSeek(current)
+  }
+}
+
+const handleSeeked = () => {
+  if (syncManager && player) {
+    const toTime = player.currentTime()
+    syncManager.endSeek(toTime)
+    
+    syncStatus.value = 'syncing'
+    setTimeout(() => {
+      syncStatus.value = 'synced'
+    }, 500)
+  }
+}
+
+const handleWaiting = () => {
+  syncStatus.value = 'syncing'
+}
+
+const handlePlaying = () => {
+  syncStatus.value = 'synced'
 }
 
 const handleEnded = async () => {
   isComplete.value = true
   progress.value = 1
   
-  if (videoInfo.value) {
-    await videoApi.completeVideo(videoInfo.value.id)
+  if (syncManager) {
+    syncManager.setPlaying(false)
+    await syncManager.complete()
   }
   
-  videoProgressSocket.send({
-    type: 'progress',
-    data: {
-      video_id: videoInfo.value?.id,
-      progress: 1,
-      current_time: duration.value,
-      duration: duration.value,
-      is_playing: false,
-      is_complete: true
+  if (videoInfo.value) {
+    try {
+      await videoApi.completeVideo(videoInfo.value.id)
+    } catch (error) {
+      console.error('Failed to mark as complete:', error)
     }
+  }
+  
+  ElMessage({
+    message: '恭喜！您已完成本课时学习',
+    type: 'success',
+    duration: 3000
   })
 }
 
 const handleLoadedMetadata = () => {
   if (!player) return
-  duration.value = player.duration()
   
-  if (progress.value > 0 && progress.value < 1) {
-    player.currentTime(progress.value * duration.value)
-  }
-}
-
-let progressTimer: number | null = null
-
-const sendProgressUpdate = (isPlaying: boolean) => {
-  if (progressTimer) {
-    clearInterval(progressTimer)
-    progressTimer = null
-  }
-  
-  const sendUpdate = async () => {
-    if (!videoInfo.value || !player) return
+  const dur = player.duration()
+  if (!isNaN(dur)) {
+    duration.value = dur
     
-    try {
-      await videoApi.updateProgress({
-        video_id: videoInfo.value.id,
-        current_time: player.currentTime(),
-        duration: player.duration(),
-        is_playing: isPlaying
-      })
-      
-      videoProgressSocket.send({
-        type: 'progress',
-        data: {
-          video_id: videoInfo.value.id,
-          progress: progress.value,
-          current_time: player.currentTime(),
-          duration: player.duration(),
-          is_playing: isPlaying
-        }
-      })
-    } catch (error) {
-      console.error('Progress update failed:', error)
+    if (progress.value > 0 && progress.value < 1) {
+      const targetTime = progress.value * duration.value
+      player.currentTime(targetTime)
+      currentTime.value = targetTime
     }
-  }
-  
-  sendUpdate()
-  
-  if (isPlaying) {
-    progressTimer = window.setInterval(sendUpdate, 5000)
   }
 }
 
-const connectWebSocket = () => {
-  if (!videoInfo.value) return
+const initSyncManager = async () => {
+  if (!lessonId.value) return
   
-  videoProgressSocket.connect(`/ws/video/progress/${videoInfo.value.id}/`, {
-    onMessage: (data: any) => {
-      console.log('WebSocket message:', data)
-    }
+  syncManager = createVideoProgressSync({
+    debounceInterval: 3000,
+    maxInterval: 15000,
+    maxRetries: 3,
+    retryDelay: 2000,
+    syncOnVisibilityChange: true
   })
+  
+  await syncManager.init(lessonId.value, handleProgressUpdate)
 }
 
 const loadData = async () => {
@@ -424,18 +498,23 @@ const loadData = async () => {
       const videos = await videoApi.getVideoByLesson(lessonId.value)
       if (videos.length > 0) {
         videoInfo.value = videos[0]
-        
-        try {
-          const progressData = await videoApi.getVideoProgress(videoInfo.value.id)
-          progress.value = progressData.progress || 0
-          isComplete.value = progressData.is_completed
-        } catch {
-          progress.value = 0
-        }
+      }
+      
+      try {
+        const progressData = await videoApi.getVideoProgress(lessonId.value)
+        progress.value = progressData.progress || 0
+        isComplete.value = progressData.is_completed || false
+        currentTime.value = progressData.current_time || 0
+        duration.value = progressData.total_duration || 0
+        version.value = progressData.version || 1
+      } catch (error) {
+        console.warn('No progress found:', error)
+        progress.value = 0
       }
     }
   } catch (error) {
     console.error('Failed to load data:', error)
+    ElMessage.error('加载视频数据失败')
   }
 }
 
@@ -476,9 +555,51 @@ const downloadMaterial = (material: any) => {
   console.log('Download material:', material)
 }
 
+const useLocalProgress = () => {
+  showConflictDialog.value = false
+  
+  if (syncManager && player) {
+    player.currentTime(localProgressTime.value)
+    syncManager.setProgress(localProgressTime.value, duration.value)
+  }
+}
+
+const useServerProgress = () => {
+  showConflictDialog.value = false
+  
+  if (syncManager && player) {
+    player.currentTime(serverProgressTime.value)
+    syncManager.setProgress(serverProgressTime.value, duration.value)
+    
+    currentTime.value = serverProgressTime.value
+    if (duration.value > 0) {
+      progress.value = serverProgressTime.value / duration.value
+    }
+  }
+}
+
 watch(showNoteDialog, (val) => {
   if (val && !noteForm.id) {
     noteForm.timestamp = currentTimeStr.value
+  }
+})
+
+watch(lessonId, async (newId, oldId) => {
+  if (newId && newId !== oldId) {
+    if (syncManager) {
+      await syncManager.destroy()
+    }
+    
+    await loadData()
+    
+    if (player) {
+      player.dispose()
+      player = null
+    }
+    
+    await nextTick()
+    await initPlayer()
+    await initSyncManager()
   }
 })
 
@@ -486,20 +607,20 @@ onMounted(async () => {
   await loadData()
   
   await nextTick()
-  if (videoInfo.value) {
+  if (videoInfo.value || lessonId.value) {
     await initPlayer()
-    connectWebSocket()
+    await initSyncManager()
   }
 })
 
-onUnmounted(() => {
+onUnmounted(async () => {
   if (player) {
     player.dispose()
   }
-  if (progressTimer) {
-    clearInterval(progressTimer)
+  
+  if (syncManager) {
+    await syncManager.destroy()
   }
-  videoProgressSocket.disconnect()
 })
 </script>
 
@@ -520,6 +641,36 @@ onUnmounted(() => {
         width: 100%;
         height: 450px;
       }
+    }
+    
+    .sync-status {
+      display: flex;
+      align-items: center;
+      justify-content: flex-end;
+      padding: 8px 0;
+      font-size: 12px;
+      color: #909399;
+      
+      .syncing {
+        animation: spin 1s linear infinite;
+      }
+      
+      .synced {
+        color: #67C23A;
+      }
+      
+      .error {
+        color: #F56C6C;
+      }
+      
+      .el-icon {
+        margin-right: 4px;
+      }
+    }
+    
+    @keyframes spin {
+      from { transform: rotate(0deg); }
+      to { transform: rotate(360deg); }
     }
     
     .video-info {
@@ -701,6 +852,43 @@ onUnmounted(() => {
             color: #909399;
             margin-top: 4px;
           }
+        }
+      }
+    }
+  }
+  
+  .conflict-info {
+    text-align: center;
+    padding: 20px 0;
+    
+    .el-icon {
+      margin-bottom: 16px;
+    }
+    
+    p {
+      margin: 16px 0;
+      color: #606266;
+    }
+    
+    .conflict-details {
+      margin-top: 20px;
+      text-align: left;
+      
+      .conflict-item {
+        display: flex;
+        justify-content: space-between;
+        padding: 8px 16px;
+        background: #f5f7fa;
+        border-radius: 4px;
+        margin-bottom: 8px;
+        
+        .local {
+          color: #909399;
+        }
+        
+        .server {
+          color: #409EFF;
+          font-weight: 600;
         }
       }
     }
